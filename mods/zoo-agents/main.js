@@ -5,6 +5,7 @@ import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
 import PACKS from "./sprites.js";
+import { startJobs } from "./jobs.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -120,6 +121,8 @@ export default class Agents extends View {
     this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
     this.pins = JSON.parse(localStorage.getItem("pins") ?? "[]");
     cx.timer.every(30000, (cx) => cx.notify());
+    // New agents' characters and the ♪ sounds (the Zoo view used to do this; jobs.js).
+    startJobs(cx);
   }
 
   // Stamps agents whose state changed. Done and idle count as one: looking at a
