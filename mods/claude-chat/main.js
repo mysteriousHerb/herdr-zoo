@@ -55,6 +55,40 @@ async function syncForeground() {
   }
 }
 syncForeground();
+// "Claude (dev container)" in the + menu (`my-new-menu`), switched in the ⚙ popup: on = this
+// computer's programs.json has the entry, so that file is the setting. On by default (the user's
+// choice 2026-11-02; it needs a harness-agent checkout beside the space's folder): the first run
+// on Windows (the command is cmd.exe) adds it, once; shared `chat.devContainer` remembers that a
+// choice was made, so Off sticks. Turning it on leaves an entry edited by hand alone; off removes
+// it. Herdr reloads programs.json live.
+const DEV_KEY = "claude-dev-container";
+const DEV_ENTRY = { name: "Claude (dev container)", icon: "icons/claude.svg", tint: false,
+  run: ["cmd.exe", "/c", "devcontainer up --workspace-folder ..\\harness-agent && devcontainer exec --workspace-folder ..\\harness-agent claude"] };
+const programsPath = () => `${appHome()}/programs.json`;
+async function devContainerOn() {
+  return Boolean(JSON.parse((await readTextFile(programsPath())) ?? "{}").programs?.[DEV_KEY]);
+}
+async function setDevContainer(on) {
+  for (let tries = 0; tries < 2; tries++) {
+    const text = await readTextFile(programsPath());
+    const p = JSON.parse(text ?? "{}");
+    const programs = { ...(p.programs ?? {}) };
+    if (Boolean(programs[DEV_KEY]) === on) return;
+    if (on) programs[DEV_KEY] = DEV_ENTRY;
+    else delete programs[DEV_KEY];
+    if (Object.keys(programs).length) p.programs = programs;
+    else delete p.programs;
+    try {
+      await writeTextFile(programsPath(), JSON.stringify(p, null, 2) + "\n", text);
+      return;
+    } catch (e) { if (tries) throw e; }
+  }
+}
+const DEV_CHOICE = "chat.devContainer";
+if (shared(DEV_CHOICE) == null && /^win/.test(os.platform())) {
+  setShared(DEV_CHOICE, true);
+  setDevContainer(true).catch(() => {});
+}
 // null = the theme's own accent.
 const ACCENTS = { theme: null, claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
 const GAPS = { tight: 6, normal: 10, roomy: 16 };
@@ -316,6 +350,12 @@ export default class ClaudeChat extends View {
         });
         this.hex[key] = s;
       }
+      // null while programs.json is read; "error" if it isn't valid JSON (left alone then).
+      this.dev = null;
+      cx.spawn(async (cx) => {
+        try { this.dev = await devContainerOn(); } catch { this.dev = "error"; }
+        cx.notify();
+      });
       return;
     }
     this.cache = new Map();
@@ -1134,7 +1174,24 @@ export default class ClaudeChat extends View {
       .child(row("Background", pills(seg("bg", "background", "Terminal"), seg("bg", "chrome", "Panel"), seg("bg", "canvas", "Canvas"))))
       .child(row("", colors("bg", BGS)))
       .child(row("Text (all of Herdr)", colors("fg", { theme: "Theme's", ...FGS })))
-      .child(row("Spacing", pills(seg("space", "tight", "Tight"), seg("space", "normal", "Normal"), seg("space", "roomy", "Roomy"))));
+      .child(row("Spacing", pills(seg("space", "tight", "Tight"), seg("space", "normal", "Normal"), seg("space", "roomy", "Roomy"))))
+      .child(div().px(8).pt(10).pb(4).text_size(11).text_color(t.dim).child("+ menu"))
+      .child(row("Claude (dev container)", this.dev === "error"
+        ? div().text_size(11).text_color(t.dim).child("programs.json isn't valid JSON")
+        : pills(...[[false, "Off"], [true, "On"]].map(([on, label]) => div().id(`dev-${label}`).px(8).h(22).flex().items_center().rounded(5)
+          .text_size(12).cursor_pointer()
+          .when(this.dev === on, (el) => el.bg(t.selected).text_color(t.foreground))
+          .when(this.dev !== on, (el) => el.text_color(t.dim).hover((s) => s.text_color(t.foreground)))
+          .on_click((_e, cx) => {
+            if (this.dev === on || this.dev === null) return;
+            this.dev = on;
+            setShared(DEV_CHOICE, on);
+            cx.spawn(async (cx) => {
+              try { await setDevContainer(on); } catch { this.dev = "error"; }
+              cx.notify();
+            });
+          })
+          .child(label)))));
   }
 
   // A scroller held at the bottom (GPUI's start at the top and can't be moved from here): the
@@ -1248,7 +1305,7 @@ export default class ClaudeChat extends View {
         .child(div().id("chat-settings").flex_none().p(4).rounded(6).text_color(t.dim).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Chat settings")
-          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 452, props: { settings: true } }))
+          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 520, props: { settings: true } }))
           .child(svg("mods/workspace-chrome/settings.svg").size(14)))
         .child(props()?.stack ? viewSwitch(t, "chat", () => this.toTerminal(agent.address))
           : this.button(t, "terminal", "Terminal", () => this.toTerminal(agent.address))))
