@@ -118,6 +118,31 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
   "hooks", "ide", "keybindings", "list-agents", "login", "logout", "mcp", "memory", "mobile", "model", "output-style",
   "permissions", "plugin", "powerup", "radio", "rate-limit-options", "release-notes", "remote-control", "resume",
   "rewind", "skills", "status", "statusline", "tasks", "theme", "tui", "usage", "workflows"]);
+
+// The box can't say where its caret is, so it's taken from the edit: the end of what changed
+// between the two values (where typing or a paste left it).
+function caretAfter(was, now) {
+  let a = 0;
+  while (a < was.length && a < now.length && was[a] === now[a]) a++;
+  let b = 0;
+  while (b < was.length - a && b < now.length - a && was[was.length - 1 - b] === now[now.length - 1 - b]) b++;
+  return now.length - b;
+}
+
+// The "/word" the caret is in, if the "/" starts the box or follows a space or line break:
+// { text, start (the "/"), end, q (what's after the "/") }, else null.
+function slashAt(text, caret) {
+  let start = caret;
+  while (start > 0 && /[\w:-]/.test(text[start - 1])) start--;
+  if (text[start - 1] !== "/") return null;
+  start--;
+  if (start > 0 && !/\s/.test(text[start - 1])) return null;
+  let end = caret;
+  while (end < text.length && /[\w:-]/.test(text[end])) end++;
+  return { text, start, end, q: text.slice(start + 1, end) };
+}
+
+const sameSlash = (a, b) => Boolean(a && b) && a.start === b.start && a.q === b.q;
 // The tool that starts a sub-agent ("Task" in older Claude Codes). Its rows are cards that open
 // the sub-agent's own conversation, read from <session>/subagents/agent-<id>.jsonl.
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
@@ -239,8 +264,9 @@ async function sessionOf(where) {
 const fileOf = (where, session) => (where.container ? `projects/${folderName(session.cwd)}/${session.sessionId}.jsonl` : transcriptOf(session));
 
 // Plain text as markdown that shows it as typed: punctuation escaped, every line break kept.
+const plainEscape = (s) => s.replace(/[\\`*_{}[\]()<>#+\-.!|~&]/g, "\\$&");
 const plainMarkdown = (s) => s.replace(/\r/g, "").split(/\n\s*\n/)
-  .map((p) => p.replace(/[\\`*_{}[\]()<>#+\-.!|~&]/g, "\\$&").replace(/\n/g, "\\\n")).join("\n\n");
+  .map((p) => plainEscape(p).replace(/\n/g, "\\\n")).join("\n\n");
 // A random v4 UUID, for a forked session's id.
 const newUuid = () => "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) =>
   (c === "x" ? Math.random() * 16 | 0 : (Math.random() * 4 | 0) + 8).toString(16));
@@ -317,6 +343,68 @@ function toolDetail(input = {}) {
   return JSON.stringify(input, null, 2);
 }
 
+// What the search looks through in an item: its text, and for a tool call its input and output
+// too (a hit there opens the row).
+function searchText(item) {
+  if (item.kind !== "tool") return item.text ?? "";
+  const input = item.input ?? {};
+  const head = AGENT_TOOLS.has(item.name) ? `${input.subagent_type ?? ""}\n${input.description ?? ""}\n${input.prompt ?? ""}`
+    : item.name === "AskUserQuestion" ? JSON.stringify(input) : `${item.name}\n${toolLine(item.name, input)}\n${toolDetail(input)}`;
+  return `${head}\n${item.result ?? ""}`;
+}
+// The query as typed, any case.
+const findRe = (q, flags = "i") => new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags);
+
+// Search hits marked in the text: <mark style="background-color: …"> put into the markdown
+// itself (a bare <mark> is a fixed pale yellow the light text can't be read on). Written just
+// so: without the space after "background-color:", or with other HTML (<code>, <a>) beside it,
+// TextView read the whole message as HTML and its markdown showed as typed (tested 2026-11-02).
+// So nothing else changes: marks go into plain text and link text, around a whole code span,
+// never into a code block, a table (HTML breaks it) or a link's address.
+const MARK = { hit: "#f59e0b59", current: "#f59e0b99" };
+// Text with every hit of `re` (global) marked; `esc` escapes the text around and in them.
+const marker = (re, color, esc = (s) => s) => (s) => {
+  let out = "", last = 0;
+  for (const m of s.matchAll(re)) {
+    if (!m[0]) break;
+    out += `${esc(s.slice(last, m.index))}<mark style="background-color: ${color}">${esc(m[0])}</mark>`;
+    last = m.index + m[0].length;
+  }
+  return out + esc(s.slice(last));
+};
+// Escapes, code spans, **strong** / *em* / ~~strike~~, [links](…) and images, <autolinks>.
+const INLINE = /\[!-\/:-@[-`{-~]|(`+).+?\1(?!`)|(\*\*|__|\*|~~)(\S(?:.*?\S)?)\2|(!?\[)([^\]]*)(\]\([^)]*\))|<https?:\/\/[^>\s]+>/g;
+function markInline(s, mark, test, color) {
+  let out = "", last = 0;
+  for (const m of s.matchAll(INLINE)) {
+    out += mark(s.slice(last, m.index));
+    last = m.index + m[0].length;
+    if (m[1] !== undefined) out += test.test(m[0]) ? `<mark style="background-color: ${color}">${m[0]}</mark>` : m[0];
+    else if (m[2] !== undefined) out += m[2] + markInline(m[3], mark, test, color) + m[2];
+    else if (m[4] !== undefined) out += m[4] + (m[4] === "[" ? markInline(m[5], mark, test, color) : m[5]) + m[6];
+    else out += m[0];
+  }
+  return out + mark(s.slice(last));
+}
+// Claude's markdown with the hits of `re` (global) marked, line by line after any list, quote
+// or heading marker.
+function markMarkdown(md, re, color) {
+  const test = new RegExp(re.source, "i");
+  const mark = marker(re, color);
+  let fence = null;
+  return md.split("\n").map((l) => {
+    const f = /^\s*(`{3,}|~{3,})/.exec(l);
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length) fence = null; return l; }
+    if (f) { fence = f[1]; return l; }
+    if (/^\s*\|/.test(l) || !test.test(l)) return l;
+    const [, head, rest] = /^(\s*(?:>\s*)*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|#{1,6}\s+)?)(.*)$/.exec(l);
+    return head + markInline(rest, mark, test, color);
+  }).join("\n");
+}
+// Your message (see plainMarkdown) with the hits marked.
+const plainMarked = (s, re, color) => s.replace(/\r/g, "").split(/\n\s*\n/)
+  .map((p) => p.split("\n").map(marker(re, color, plainEscape)).join("\\\n")).join("\n\n");
+
 // The Chat / Terminal switch, the same in my-pane's header (a mod can't import another's).
 function viewSwitch(t, here, flip) {
   const seg = (id, label) => div().id(`view-${id}`).px(8).h(20).flex().items_center().rounded(5)
@@ -363,27 +451,67 @@ export default class ClaudeChat extends View {
     this.open = new Set();
     // Earlier turns whose work was clicked open, as "<address>:<index of its first item>".
     this.unfolded = new Set();
+    // Images pasted for a dev container's Claude: their paths in the container, by agent address,
+    // sent with the next message (see pasteIntoContainer).
+    this.pasted = new Map();
     this.box = TextareaState.new({ placeholder: "Message Claude…  (Enter sends, Shift+Enter: new line)" });
     this.box.set_auto_grow(1, 8);
     this.keyboard = cx.focus_handle();
     this.typed = ""; this.menuAt = 0; this.menuOff = false;
+    // The "/word" being typed, anywhere in the box (see slashAt), or null.
+    this.slash = null;
     // A redraw rebuilds every message, so typing redraws only for the / menu, the one thing
     // that depends on what's typed (the box draws its own text).
-    const slash = (s) => /^\/[\w:-]*\n?$/.test(s);
     this.box.on("change", (_e, cx) => {
-      const was = this.typed;
-      this.typed = this.box.value(); this.menuAt = 0; this.menuOff = false;
-      if (slash(was) || slash(this.typed)) cx.notify();
+      const was = this.typed, had = this.slash;
+      this.typed = this.box.value();
+      // Enter's newline, typed at the word (it arrives before submit): keep the menu as it was
+      // for submit to use; complete() drops the newline.
+      if (had && this.typed === was.slice(0, had.end) + "\n" + was.slice(had.end)) return;
+      this.slash = slashAt(this.typed, caretAfter(was, this.typed));
+      if (!sameSlash(had, this.slash)) { this.menuAt = 0; this.menuOff = false; }
+      if (had || this.slash) cx.notify();
     });
     // Enter has already put its newline in; Shift+Enter keeps it. With the / menu open,
-    // Enter runs the highlighted command, as in Claude's own menu.
+    // Enter runs the highlighted command, as in Claude's own menu, when the command starts the
+    // message; further in (a skill named mid-sentence), it only fills the name in.
     this.box.on("submit", (e, cx) => {
       if (e.shift) return;
       const pick = this.matches()[this.menuAt];
-      if (pick) this.box.set_value(`/${pick[0]}`);
+      if (pick && this.slash.start > 0) { this.complete(pick[0]); return cx.notify(); }
+      if (pick) this.box.set_value(`/${pick[0]}${this.slash.text.slice(this.slash.end)}`);
       this.send(cx);
     });
     this.box.on("paste_other", (_e, cx) => this.pasteImage(cx));
+    // The / menu's keys. The box binds ↑ ↓ Tab Esc ← → Home End itself (input::MoveUp,
+    // IndentInline, …): those actions run before any key handler around it and stop the key,
+    // so an on_key_down on the composer never saw them. Bindings of our own under a deeper
+    // context come first (the win98 mod's trick for Escape): the composer is "ChatSlash" while
+    // the menu is open, and the box inside it is gpui-component's "Input".
+    try {
+      cx.bind_keys(["Input", "Textarea", "TextArea"].flatMap((box) => [
+        ["down", "claude_chat_menu_down"], ["up", "claude_chat_menu_up"], ["tab", "claude_chat_menu_fill"],
+        ["escape", "claude_chat_menu_close"], ["left", "claude_chat_menu_leave"], ["right", "claude_chat_menu_leave"],
+        ["home", "claude_chat_menu_leave"], ["end", "claude_chat_menu_leave"],
+      ].map(([keystroke, action]) => ({ keystroke, action, context: `ChatSlash > ${box}` }))));
+    } catch {}
+    // Search (Ctrl+F, or the header's magnifier): findQ is the query in use (typing settles for
+    // 150 ms first, since a redraw rebuilds every message), findList its hits oldest first
+    // ({ item, id }: id = the row's), findAt the current one. seek: the row to scroll to.
+    this.findOpen = false; this.findQ = ""; this.findList = []; this.findAt = null; this.findKey = null; this.findWhat = null;
+    this.findBox = InputState.new({ placeholder: "Search this chat" });
+    this.findKeys = cx.focus_handle();
+    this.rootKeys = cx.focus_handle();
+    this.findBox.on("change", (_e, cx) => {
+      const gen = (this.findGen = (this.findGen ?? 0) + 1);
+      cx.timer.after(150, (cx) => {
+        if (gen !== this.findGen) return;
+        this.findQ = this.findBox.value().trim();
+        cx.notify();
+      });
+    });
+    // From the newest hit up: Enter goes to the older one, Shift+Enter the newer.
+    this.findBox.on("submit", (e, cx) => this.findStep(e.shift ? 1 : -1, cx));
     cx.timer.every(2000, (cx) => this.tick(cx));
     this.tick(cx);
   }
@@ -400,7 +528,7 @@ export default class ClaudeChat extends View {
     this.subs = kept.subs ?? new Map(); this.trail = [];
     this.looked = kept.looked ?? 0; this.stale = Boolean(kept.file); this.lastReply = kept.lastReply ?? null;
     this.limit = PAGE; this.problem = null; this.screen = null; this.up = 0;
-    this.rowH = new Map();
+    this.rowH = new Map(); this.seek = null;
   }
 
   // The other Claude agents' sessions, found ahead of time (one process walk for all), so
@@ -764,31 +892,54 @@ export default class ClaudeChat extends View {
   // The / menu: Claude's commands and this session's skills matching what's typed after "/",
   // names that start with it first.
   matches() {
-    const m = /^\/([\w:-]*)$/.exec(this.typed.replace(/\n$/, ""));
-    if (!m || this.menuOff) return [];
-    const q = m[1].toLowerCase();
+    if (!this.slash || this.menuOff) return [];
+    const q = this.slash.q.toLowerCase();
     const known = new Set(COMMANDS.map(([name]) => name));
     const all = [...COMMANDS, ...[...this.skills].filter(([name]) => !known.has(name))];
     return [...all.filter(([n]) => n.startsWith(q)), ...all.filter(([n]) => !n.startsWith(q) && n.includes(q))].slice(0, 8);
   }
 
+  // Puts the picked name in place of the "/word" being typed (Enter's newline dropped), with
+  // a space after it, and the caret after that.
   complete(name) {
-    this.box.set_value(`/${name} `);
+    const { text, start, end } = this.slash;
+    const rest = text.slice(end);
+    const head = `${text.slice(0, start)}/${name}${rest.startsWith(" ") ? "" : " "}`;
+    this.slash = null;
+    this.box.set_value(head + rest);
+    this.box.set_selected_range({ start: head.length, end: head.length });
     this.typed = this.box.value();
     this.box.focus();
   }
 
+  // A / menu key (see the bindings in init).
+  menuKey(key, cx) {
+    const list = this.matches();
+    if (!list.length) return;
+    if (key === "down") this.menuAt = (this.menuAt + 1) % list.length;
+    else if (key === "up") this.menuAt = (this.menuAt + list.length - 1) % list.length;
+    else if (key === "fill") this.complete(list[this.menuAt][0]);
+    else if (key === "close") this.menuOff = true;
+    else this.slash = null;
+    cx.notify();
+  }
+
   send(cx) {
     const text = this.box.value().trim();
-    if ((!text && !this.images) || !this.address) return;
+    if (!this.address || (!text && !this.imageCount(this.address))) return;
     const address = this.address;
     this.box.set_value("");
     this.typed = "";
+    this.slash = null;
     // While Claude asks, what's typed is the "Type something" answer.
     if (text && ask.typeAnswer(this, text, cx)) { cx.timer.after(600, (cx) => this.tick(cx)); return cx.notify(); }
     this.images = 0;
+    // A dev container's pasted images go as their paths in the container, after the text.
+    const files = this.where?.container ? (this.pasted.get(address) ?? []) : [];
+    this.pasted.delete(address);
+    const message = [text, ...files.map((f) => `[Image: ${f}]`)].filter(Boolean).join("\n");
     // Pasted images are already in Claude's prompt: Enter alone sends them.
-    cx.spawn(async () => { await hc(text ? ["send", address, text] : ["keys", address, "enter"]); });
+    cx.spawn(async () => { await hc(message ? ["send", address, message] : ["keys", address, "enter"]); });
     // These open a menu or a screen in Claude's terminal: show it there.
     if (OPENS.has(text.slice(1))) this.toTerminal(address);
     cx.notify();
@@ -805,7 +956,8 @@ export default class ClaudeChat extends View {
         .child(div().w(170).flex_none().truncate().text_color(t.foreground).child(`/${name}`))
         .child(div().flex_1().min_w(0).truncate().text_size(px(12)).text_color(t.dim).child(about))
         .when(opens(name), (el) => el.child(div().flex_none().text_size(px(10)).text_color(t.dim).child("opens in Terminal")))))
-      .child(div().px(8).pt(4).text_size(px(10)).text_color(t.dim).child("Enter runs · Tab or click fills in · ↑↓ · Esc"));
+      .child(div().px(8).pt(4).text_size(px(10)).text_color(t.dim)
+        .child(this.slash.start > 0 ? "Enter, Tab or click fills in · ↑↓ · Esc" : "Enter runs · Tab or click fills in · ↑↓ · Esc"));
   }
 
   // A paste with no text (an image): Claude reads the clipboard itself on its paste-image key
@@ -814,14 +966,54 @@ export default class ClaudeChat extends View {
   pasteImage(cx) {
     if (!this.address) return;
     const address = this.address;
+    if (this.where?.container) return this.pasteIntoContainer(address, this.where, cx);
     this.images = (this.images ?? 0) + 1;
     cx.spawn(async () => { await hc(["keys", address, /^win/.test(os.platform()) ? "alt+v" : "ctrl+v"]); });
     cx.notify();
   }
 
+  // A dev container's Claude runs on Linux with no clipboard (no X or Wayland, no xclip), so its
+  // paste key finds nothing. Instead the clipboard image is saved here as a PNG, copied into the
+  // container with `docker cp`, and its path goes with the next message (the way Herdr pastes an
+  // image into a terminal on another machine). That Claude runs with bypassPermissions, so it
+  // reads /tmp without asking. Windows only (the clipboard is read with .NET).
+  pasteIntoContainer(address, where, cx) {
+    if (!/^win/.test(os.platform())) { this.pasteNote = "Pasting images into a dev container needs Windows"; return cx.notify(); }
+    const name = `herdr-paste-${newUuid()}.png`;
+    this.pasteNote = "Copying the image into the container…";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      // The clipboard's image, else the first image file copied in Explorer. Exit 3 = no image.
+      const r = await exec("powershell", ["-NoProfile", "-STA", "-Command",
+        "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms, System.Drawing; " +
+        `$p = Join-Path $env:TEMP '${name}'; $img = [Windows.Forms.Clipboard]::GetImage(); ` +
+        "if (-not $img) { $f = [Windows.Forms.Clipboard]::GetFileDropList() | Where-Object { $_ -match '\\.(png|jpe?g|gif|webp|bmp)$' } | Select-Object -First 1; " +
+        "if (-not $f) { exit 3 }; $img = [Drawing.Image]::FromFile($f) }; " +
+        "$img.Save($p, [Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); " +
+        `docker cp $p '${where.container}:/tmp/${name}'; $c = $LASTEXITCODE; Remove-Item $p; exit $c`])
+        .catch((e) => ({ code: -1, stderr: String(e) }));
+      if (r.code === 0) {
+        this.pasted.set(address, [...(this.pasted.get(address) ?? []), `/tmp/${name}`]);
+        this.pasteNote = null;
+      } else {
+        this.pasteNote = r.code === 3 ? "No image on the clipboard" : `Couldn't copy the image: ${(r.stderr || `exit ${r.code}`).trim().slice(0, 200)}`;
+        cx.timer.after(6000, (cx) => { this.pasteNote = null; cx.notify(); });
+      }
+      cx.notify();
+    });
+  }
+
+  // How many images wait to go with the next message: in Claude's prompt, or (dev container)
+  // as files we hold.
+  imageCount(address) {
+    return this.where?.container ? (this.pasted.get(address)?.length ?? 0) : (this.images ?? 0);
+  }
+
   // Esc twice empties Claude's prompt, images and all (not while it's working: Esc stops it).
+  // A dev container's images were never in its prompt: just forget them.
   dropImages(cx) {
     const address = this.address;
+    if (this.where?.container) { this.pasted.delete(address); return cx.notify(); }
     this.images = 0;
     cx.spawn(async () => { await hc(["keys", address, "esc", "esc"]); });
     cx.notify();
@@ -911,7 +1103,8 @@ export default class ClaudeChat extends View {
         .when(mine === "bar", (el) => el.border_l(3).border_color(t.accent))
         // A TextView so it can be selected like Claude's text; escaped so it shows as typed.
         .child(h_flex().w_full().gap(8).items_center()
-          .child(div().flex_1().min_w(0).child(TextView.markdown(`me-${i}`, plainMarkdown(item.text)).selectable(true)))
+          .child(div().flex_1().min_w(0).child(TextView.markdown(`me-${i}`,
+            this.markIn(i) ? plainMarked(item.text, this.marks.re, this.markIn(i)) : plainMarkdown(item.text)).selectable(true)))
           .when(Boolean(item.before && this.agentNow), (el) => el.child(div().id(`fork-${i}`).flex_none().p(2).rounded(4)
             .text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Fork from here: a copy of the conversation up to just before this message, in a new tab")
@@ -921,7 +1114,8 @@ export default class ClaudeChat extends View {
     if (item.kind === "claude") {
       return h_flex().w_full().gap(8).items_start()
         .child(div().mt(4).size(8).flex_none().rounded(4).bg(t.accent))
-        .child(div().flex_1().min_w(0).text_color(t.foreground).child(TextView.markdown(`md-${i}`, item.text).selectable(true)));
+        .child(div().flex_1().min_w(0).text_color(t.foreground).child(TextView.markdown(`md-${i}`,
+          this.markIn(i) ? markMarkdown(item.text, this.marks.re, this.markIn(i)) : item.text).selectable(true)));
     }
     if (item.kind === "note") {
       return div().w_full().px(10).py(4).text_size(px(12)).text_color(t.dim)
@@ -990,11 +1184,13 @@ export default class ClaudeChat extends View {
   }
 
   // The row standing for a turn's work, like a tool row: "▸ 12 tools · 3 messages".
-  turnRow(t, { work, key, open }) {
+  turnRow(t, { work, key, open }, found) {
     const count = (kind, one, many) => {
       const n = work.filter(([x]) => x.kind === kind).length;
       return n ? `${n} ${n === 1 ? one : many}` : null;
     };
+    // Search hits folded away in it.
+    const hits = !open && found.size ? work.filter(([, id]) => found.has(id)).length : 0;
     const about = [count("tool", "tool", "tools"), count("claude", "message", "messages")].filter(Boolean).join(" · ") || `${work.length} more`;
     return v_flex().w_full().pl(16)
       .child(h_flex().id(`turn-${key}`).gap(8).items_center().py(2).px(6).rounded(6).cursor_pointer()
@@ -1002,7 +1198,8 @@ export default class ClaudeChat extends View {
         // The row stays where it is and the work opens below it (see log's on_size_change).
         .on_click((_e, cx) => { open ? this.unfolded.delete(key) : this.unfolded.add(key); this.holdTop = true; cx.notify(); })
         .child(h_flex().w(12).flex_none().justify_center().text_size(px(10)).child(open ? "▾" : "▸"))
-        .child(div().flex_1().min_w(0).truncate().child(open ? `Fold ${about}` : about)));
+        .child(div().flex_1().min_w(0).truncate().child(open ? `Fold ${about}` : about))
+        .when(hits > 0, (el) => el.child(div().flex_none().text_color(t.accent).child(hits === 1 ? "1 match" : `${hits} matches`))));
   }
 
   // The bar over an opened sub-agent's conversation: back to the chat (or the sub-agent that started it).
@@ -1243,6 +1440,112 @@ export default class ClaudeChat extends View {
     return null;
   }
 
+  // ---- search
+
+  openFind(cx) {
+    this.findOpen = true;
+    // What was searched last is kept, selected, so typing replaces it.
+    this.findQ = this.findBox.value().trim();
+    this.findBox.set_selected_range({ start: 0, end: this.findBox.value().length });
+    cx.timer.after(30, () => this.findBox.focus());
+    cx.notify();
+  }
+
+  closeFind(cx) {
+    this.findOpen = false; this.findQ = ""; this.findList = []; this.findAt = null; this.findKey = null; this.findWhat = null; this.seek = null;
+    this.box.focus();
+    cx.notify();
+  }
+
+  // -1: the older hit, 1: the newer (both wrap round). A query still settling is taken first.
+  findStep(dir, cx) {
+    const q = this.findBox.value().trim();
+    if (q !== this.findQ) { this.findQ = q; return cx.notify(); }
+    const n = this.findList.length;
+    if (!n) return;
+    this.findAt = ((this.findAt ?? n - 1) + dir + n) % n;
+    this.seekTo(this.findList[this.findAt]);
+    cx.notify();
+  }
+
+  // Scrolls to a hit (see resolveSeek). A hit in a tool's input or output, not its one-line
+  // summary, opens the row.
+  seekTo({ item, id }) {
+    this.seek = id; this.seekTries = 0; this.seekShown = false;
+    if (item.kind === "tool" && !AGENT_TOOLS.has(item.name) && item.name !== "AskUserQuestion"
+      && !findRe(this.findQ).test(`${item.name} ${toolLine(item.name, item.input)}`)) this.open.add(item.id);
+  }
+
+  // The hits among what can be shown ([item, row id] pairs), as a set of row ids. Searched again
+  // only when the query or the conversation changed; a new query (or agent) goes to the newest
+  // hit, new lines keep the current one.
+  findings(entries, sub) {
+    if (!this.findOpen || !this.findQ) { this.findList = []; this.findAt = null; this.findKey = null; this.findWhat = null; return new Set(); }
+    const what = JSON.stringify([this.findQ, this.address, sub?.name ?? null]);
+    const key = `${what}|${entries.length}|${this.version}`;
+    if (key !== this.findKey) {
+      const re = findRe(this.findQ);
+      const was = this.findList[this.findAt]?.id;
+      this.findList = entries.filter(([item]) => re.test(searchText(item))).map(([item, id]) => ({ item, id }));
+      const k = what === this.findWhat ? this.findList.findIndex((m) => m.id === was) : -1;
+      this.findAt = k >= 0 ? k : this.findList.length ? this.findList.length - 1 : null;
+      if (what !== this.findWhat && this.findAt !== null) this.seekTo(this.findList[this.findAt]);
+      this.findWhat = what; this.findKey = key;
+    }
+    return new Set(this.findList.map((m) => m.id));
+  }
+
+  // The mark color for the hits in row `id`'s text (brighter in the current one), or null.
+  markIn(id) {
+    const m = this.marks;
+    return m?.found.has(id) ? (id === m.current ? MARK.current : MARK.hit) : null;
+  }
+
+  // Puts the row being sought in the middle of the view (its top, if it's taller), once the rows
+  // are measured: a frame or more after the jump, so a turn or tool row it opened has its height.
+  resolveSeek(cx) {
+    const list = this.rowList ?? [];
+    const k = list.findIndex((r) => r.id === this.seek);
+    const tries = this.seekTries++;
+    const ready = k >= 0 && tries > 0 && list.slice(k).every((r) => this.rowH.has(r.id));
+    if (!ready && tries < 6) { cx.timer.after(80, (cx) => cx.notify()); return; }
+    this.seek = null;
+    if (k < 0) return;
+    const gap = GAPS[chatLook().space] ?? 10;
+    let below = 12; // the body's bottom padding
+    for (let j = list.length - 1; j > k; j--) below += (this.rowH.get(list[j].id) ?? 0) + gap;
+    const h = this.rowH.get(list[k].id) ?? 0;
+    const view = this.viewH ?? 0;
+    const up = h > view - 60 ? below + h - view + 30 : below + h / 2 - view / 2;
+    this.up = Math.max(0, Math.min(up, (this.contentH ?? 0) - view));
+  }
+
+  findBar(t) {
+    const n = this.findList.length;
+    const count = !this.findQ ? "" : n ? `${this.findAt + 1} of ${n}` : "No matches";
+    const icon = (id, label, tip, onClick) => div().id(id).flex_none().size(24).flex().items_center().justify_center().rounded(5)
+      .cursor_pointer().text_color(n ? t.foreground : t.dim).hover((s) => s.bg(t.hover)).tooltip(tip).on_click(onClick).child(label);
+    return h_flex().id("find-bar").track_focus(this.findKeys).h(38).flex_none().px(12).gap(8).items_center()
+      .border_b(1).border_color(t.border).bg(t.chrome).text_size(12)
+      // Keys pass through here on their way up from the search box.
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") this.closeFind(cx);
+        else if (e.key === "up") this.findStep(-1, cx);
+        else if (e.key === "down") this.findStep(1, cx);
+        else return;
+        cx.stop_propagation();
+      })
+      .child(svg("mods/workspace-chrome/search.svg").size(13).flex_none().text_color(t.dim))
+      .child(div().flex_1().min_w(0).h(26).px(6).flex().items_center().rounded(6).bg(t.background).border(1).border_color(t.input)
+        .text_color(t.foreground).child(Input.new(this.findBox)))
+      .child(div().flex_none().text_color(n || !this.findQ ? t.dim : t.blocked).child(count))
+      .child(icon("find-prev", "↑", "Older match (Enter, ↑)", (_e, cx) => this.findStep(-1, cx)))
+      .child(icon("find-next", "↓", "Newer match (Shift+Enter, ↓)", (_e, cx) => this.findStep(1, cx)))
+      .child(div().id("find-close").flex_none().size(24).flex().items_center().justify_center().rounded(5).cursor_pointer()
+        .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Close (Esc)")
+        .on_click((_e, cx) => this.closeFind(cx)).child("×"));
+  }
+
   render(cx) {
     if (props()?.settings) return this.settingsMenu(theme());
     const t = chatTheme();
@@ -1275,28 +1578,61 @@ export default class ClaudeChat extends View {
     // Questions a hook sent back are left out: Claude asks again at once.
     const all = (sub ? sub.items : this.items).map((item, i) => [item, sub ? `${sub.name}-${i}` : i])
       .filter(([item]) => !ask.rejected(item));
-    const listed = sub || look.history === "show" ? all.filter(visible) : this.turns(all, visible);
+    const found = this.findings(all.filter(visible), sub);
+    const current = this.findList[this.findAt]?.id;
+    this.marks = found.size ? { re: findRe(this.findQ, "gi"), found, current } : null;
+    let listed = sub || look.history === "show" ? all.filter(visible) : this.turns(all, visible);
+    // The hit being sought: inside a folded turn, the turn opens; above the loaded rows, more load.
+    if (this.seek !== null && !this.seekShown) {
+      this.seekShown = true;
+      const fold = listed.find((x) => x.work && !x.open && x.work.some(([, id]) => id === this.seek));
+      if (fold) { this.unfolded.add(fold.key); listed = this.turns(all, visible); }
+      const at = listed.findIndex((x) => !x.work && x[1] === this.seek);
+      if (at >= 0 && listed.length - at > this.limit) this.limit = listed.length - at + 10;
+    }
     const shown = listed.slice(-this.limit);
     const hidden = listed.length - shown.length;
     this.agentWorking = agent.status === "working";
     // Each row measured, so ↑ Previous message knows where your messages are (see prevMine).
     this.rowList = shown.map((x) => ({ id: x.work ? x.key : x[1], mine: !x.work && x[0].kind === "user" }));
-    const rows = shown.map((x, k) => div().id(`row-${this.rowList[k].id}`).w_full()
-      .on_size_change(((id) => (s) => { this.rowH.set(id, s.height); })(this.rowList[k].id))
-      .child(x.work ? this.turnRow(t, x) : this.bubble(t, x[0], x[1])));
+    const rows = shown.map((x, k) => {
+      const id = this.rowList[k].id;
+      const hit = !x.work && found.has(id);
+      return div().id(`row-${id}`).w_full()
+        .on_size_change((s) => { this.rowH.set(id, s.height); })
+        // Search hits tinted, the current one outlined (the same padding on all, so moving between
+        // them doesn't shift the rows).
+        .when(hit, (el) => el.p(3).rounded(8).border(1).bg(fade(t.accent, id === current ? "1f" : "0d"))
+          .border_color(id === current ? t.accent : fade(t.accent, "33")))
+        .child(x.work ? this.turnRow(t, x, found) : this.bubble(t, x[0], x[1]));
+    });
+    if (this.seek !== null) this.resolveSeek(cx);
     // Built once each: they're shown only when there is one.
     const chips = this.subChips(t);
     const status = this.status(t, agent);
+    const images = this.imageCount(agent.address);
     const menu = this.menu(t);
     if (hidden > 0) rows.unshift(h_flex().w_full().justify_center().child(
       this.button(t, "earlier", `Show earlier (${hidden})`, (_e, cx) => { this.limit += PAGE; cx.notify(); })));
 
-    return root
+    // Ctrl+F from anywhere in the chat (the box, the search box) opens the search, or goes back to it.
+    return root.id("chat-root").track_focus(this.rootKeys)
+      .on_key_down((e, cx) => {
+        if (!["ctrl-f", "cmd-f"].includes(e.keystroke)) return;
+        cx.stop_propagation();
+        this.openFind(cx);
+      })
       .child(h_flex().h(34).flex_none().text_size(13).px(12).gap(8).items_center().border_b(1).border_color(t.border).bg(t.chrome)
         .child(div().size(8).flex_none().rounded(4).bg(t[agent.status] ?? t.dim))
         .child(div().flex_1().min_w(0).truncate().font_semibold().text_color(t.foreground).child(agent.title || "Claude"))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(`${agent.space_name} · ${agent.address}`))
         .when(Boolean(this.forkNote), (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child(this.forkNote)))
+        .child(div().id("chat-find").flex_none().p(4).rounded(6).cursor_pointer()
+          .text_color(this.findOpen ? t.foreground : t.dim).when(this.findOpen, (el) => el.bg(t.selected))
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .tooltip("Search this chat (Ctrl+F)")
+          .on_click((_e, cx) => (this.findOpen ? this.closeFind(cx) : this.openFind(cx)))
+          .child(svg("mods/workspace-chrome/search.svg").size(14)))
         .when(Boolean(this.session?.sessionId) && !sub, (el) => el.child(div().id("chat-fork").flex_none().p(4).rounded(6)
           .text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Fork: a copy of this conversation in a new tab")
@@ -1310,30 +1646,29 @@ export default class ClaudeChat extends View {
         .child(props()?.stack ? viewSwitch(t, "chat", () => this.toTerminal(agent.address))
           : this.button(t, "terminal", "Terminal", () => this.toTerminal(agent.address))))
       .when(Boolean(sub), (el) => el.child(this.subBar(t, sub)))
+      .when(this.findOpen, (el) => el.child(this.findBar(t)))
       .child(font(this.log(t, agent, rows, sub)))
       .child(font(v_flex()).flex_none().p(10).gap(8).border_t(1).border_color(t.border).bg(t.chrome)
         .when(Boolean(chips), (el) => el.child(chips))
         .when(Boolean(status), (el) => el.child(status))
-        .when(this.images > 0, (el) => el.child(h_flex().gap(8).items_center().px(4).text_size(px(12)).text_color(t.muted)
+        .when(Boolean(this.pasteNote), (el) => el.child(div().px(4).text_size(px(12)).text_color(t.muted).child(this.pasteNote)))
+        .when(images > 0, (el) => el.child(h_flex().gap(8).items_center().px(4).text_size(px(12)).text_color(t.muted)
           .child(div().px(8).py(2).rounded(6).bg(t.raised).text_color(t.foreground)
-            .child(this.images === 1 ? "🖼 1 image" : `🖼 ${this.images} images`))
-          .child(div().flex_1().min_w(0).truncate().child("in Claude's prompt, sent with your message"))
-          .when(agent.status !== "working", (el) => el.child(this.button(t, "drop-images", "Remove", (_e, cx) => this.dropImages(cx))))))
+            .child(images === 1 ? "🖼 1 image" : `🖼 ${images} images`))
+          .child(div().flex_1().min_w(0).truncate().child(this.where?.container
+            ? "copied into the container, sent with your message" : "in Claude's prompt, sent with your message"))
+          .when(Boolean(this.where?.container) || agent.status !== "working", (el) => el.child(this.button(t, "drop-images", "Remove", (_e, cx) => this.dropImages(cx))))))
         .when(Boolean(menu), (el) => el.child(menu))
-        // Keys pass through here on their way up from the box: the menu takes ↑ ↓ Tab Esc.
+        // While the menu is open, ↑ ↓ Tab Esc are its keys (bound in init); ← → Home End close
+        // it (the caret would leave the word with no change event), and the next press moves.
         // No Send button: Enter sends (the placeholder says so).
         .child(h_flex().id("composer").track_focus(this.keyboard)
-          .on_key_down((e, cx) => {
-            const list = this.matches();
-            if (!list.length) return;
-            if (e.key === "down") this.menuAt = (this.menuAt + 1) % list.length;
-            else if (e.key === "up") this.menuAt = (this.menuAt + list.length - 1) % list.length;
-            else if (e.key === "tab") this.complete(list[this.menuAt][0]);
-            else if (e.key === "escape") this.menuOff = true;
-            else return;
-            cx.stop_propagation();
-            cx.notify();
-          })
+          .when(Boolean(menu), (el) => el.key_context("ChatSlash"))
+          .on_action("claude_chat_menu_down", (_e, cx) => this.menuKey("down", cx))
+          .on_action("claude_chat_menu_up", (_e, cx) => this.menuKey("up", cx))
+          .on_action("claude_chat_menu_fill", (_e, cx) => this.menuKey("fill", cx))
+          .on_action("claude_chat_menu_close", (_e, cx) => this.menuKey("close", cx))
+          .on_action("claude_chat_menu_leave", (_e, cx) => this.menuKey("leave", cx))
           .child(div().flex_1().min_w(0).p(6).rounded(8).bg(t.background).border(1).border_color(t.input)
             .child(Textarea.new(this.box)))));
   }
