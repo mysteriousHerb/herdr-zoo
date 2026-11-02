@@ -118,6 +118,31 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
   "hooks", "ide", "keybindings", "list-agents", "login", "logout", "mcp", "memory", "mobile", "model", "output-style",
   "permissions", "plugin", "powerup", "radio", "rate-limit-options", "release-notes", "remote-control", "resume",
   "rewind", "skills", "status", "statusline", "tasks", "theme", "tui", "usage", "workflows"]);
+
+// The box can't say where its caret is, so it's taken from the edit: the end of what changed
+// between the two values (where typing or a paste left it).
+function caretAfter(was, now) {
+  let a = 0;
+  while (a < was.length && a < now.length && was[a] === now[a]) a++;
+  let b = 0;
+  while (b < was.length - a && b < now.length - a && was[was.length - 1 - b] === now[now.length - 1 - b]) b++;
+  return now.length - b;
+}
+
+// The "/word" the caret is in, if the "/" starts the box or follows a space or line break:
+// { text, start (the "/"), end, q (what's after the "/") }, else null.
+function slashAt(text, caret) {
+  let start = caret;
+  while (start > 0 && /[\w:-]/.test(text[start - 1])) start--;
+  if (text[start - 1] !== "/") return null;
+  start--;
+  if (start > 0 && !/\s/.test(text[start - 1])) return null;
+  let end = caret;
+  while (end < text.length && /[\w:-]/.test(text[end])) end++;
+  return { text, start, end, q: text.slice(start + 1, end) };
+}
+
+const sameSlash = (a, b) => Boolean(a && b) && a.start === b.start && a.q === b.q;
 // The tool that starts a sub-agent ("Task" in older Claude Codes). Its rows are cards that open
 // the sub-agent's own conversation, read from <session>/subagents/agent-<id>.jsonl.
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
@@ -363,24 +388,35 @@ export default class ClaudeChat extends View {
     this.open = new Set();
     // Earlier turns whose work was clicked open, as "<address>:<index of its first item>".
     this.unfolded = new Set();
+    // Images pasted for a dev container's Claude: their paths in the container, by agent address,
+    // sent with the next message (see pasteIntoContainer).
+    this.pasted = new Map();
     this.box = TextareaState.new({ placeholder: "Message Claude…  (Enter sends, Shift+Enter: new line)" });
     this.box.set_auto_grow(1, 8);
     this.keyboard = cx.focus_handle();
     this.typed = ""; this.menuAt = 0; this.menuOff = false;
+    // The "/word" being typed, anywhere in the box (see slashAt), or null.
+    this.slash = null;
     // A redraw rebuilds every message, so typing redraws only for the / menu, the one thing
     // that depends on what's typed (the box draws its own text).
-    const slash = (s) => /^\/[\w:-]*\n?$/.test(s);
     this.box.on("change", (_e, cx) => {
-      const was = this.typed;
-      this.typed = this.box.value(); this.menuAt = 0; this.menuOff = false;
-      if (slash(was) || slash(this.typed)) cx.notify();
+      const was = this.typed, had = this.slash;
+      this.typed = this.box.value();
+      // Enter's newline or Tab's tab, typed at the word (they arrive before submit and the key
+      // handler): keep the menu as it was for those to use; complete() drops the character.
+      if (had && ["\n", "\t"].some((c) => this.typed === was.slice(0, had.end) + c + was.slice(had.end))) return;
+      this.slash = slashAt(this.typed, caretAfter(was, this.typed));
+      if (!sameSlash(had, this.slash)) { this.menuAt = 0; this.menuOff = false; }
+      if (had || this.slash) cx.notify();
     });
     // Enter has already put its newline in; Shift+Enter keeps it. With the / menu open,
-    // Enter runs the highlighted command, as in Claude's own menu.
+    // Enter runs the highlighted command, as in Claude's own menu, when the command starts the
+    // message; further in (a skill named mid-sentence), it only fills the name in.
     this.box.on("submit", (e, cx) => {
       if (e.shift) return;
       const pick = this.matches()[this.menuAt];
-      if (pick) this.box.set_value(`/${pick[0]}`);
+      if (pick && this.slash.start > 0) { this.complete(pick[0]); return cx.notify(); }
+      if (pick) this.box.set_value(`/${pick[0]}${this.slash.text.slice(this.slash.end)}`);
       this.send(cx);
     });
     this.box.on("paste_other", (_e, cx) => this.pasteImage(cx));
@@ -764,31 +800,42 @@ export default class ClaudeChat extends View {
   // The / menu: Claude's commands and this session's skills matching what's typed after "/",
   // names that start with it first.
   matches() {
-    const m = /^\/([\w:-]*)$/.exec(this.typed.replace(/\n$/, ""));
-    if (!m || this.menuOff) return [];
-    const q = m[1].toLowerCase();
+    if (!this.slash || this.menuOff) return [];
+    const q = this.slash.q.toLowerCase();
     const known = new Set(COMMANDS.map(([name]) => name));
     const all = [...COMMANDS, ...[...this.skills].filter(([name]) => !known.has(name))];
     return [...all.filter(([n]) => n.startsWith(q)), ...all.filter(([n]) => !n.startsWith(q) && n.includes(q))].slice(0, 8);
   }
 
+  // Puts the picked name in place of the "/word" being typed (Enter's newline dropped), with
+  // a space after it, and the caret after that.
   complete(name) {
-    this.box.set_value(`/${name} `);
+    const { text, start, end } = this.slash;
+    const rest = text.slice(end);
+    const head = `${text.slice(0, start)}/${name}${rest.startsWith(" ") ? "" : " "}`;
+    this.slash = null;
+    this.box.set_value(head + rest);
+    this.box.set_selected_range({ start: head.length, end: head.length });
     this.typed = this.box.value();
     this.box.focus();
   }
 
   send(cx) {
     const text = this.box.value().trim();
-    if ((!text && !this.images) || !this.address) return;
+    if (!this.address || (!text && !this.imageCount(this.address))) return;
     const address = this.address;
     this.box.set_value("");
     this.typed = "";
+    this.slash = null;
     // While Claude asks, what's typed is the "Type something" answer.
     if (text && ask.typeAnswer(this, text, cx)) { cx.timer.after(600, (cx) => this.tick(cx)); return cx.notify(); }
     this.images = 0;
+    // A dev container's pasted images go as their paths in the container, after the text.
+    const files = this.where?.container ? (this.pasted.get(address) ?? []) : [];
+    this.pasted.delete(address);
+    const message = [text, ...files.map((f) => `[Image: ${f}]`)].filter(Boolean).join("\n");
     // Pasted images are already in Claude's prompt: Enter alone sends them.
-    cx.spawn(async () => { await hc(text ? ["send", address, text] : ["keys", address, "enter"]); });
+    cx.spawn(async () => { await hc(message ? ["send", address, message] : ["keys", address, "enter"]); });
     // These open a menu or a screen in Claude's terminal: show it there.
     if (OPENS.has(text.slice(1))) this.toTerminal(address);
     cx.notify();
@@ -805,7 +852,8 @@ export default class ClaudeChat extends View {
         .child(div().w(170).flex_none().truncate().text_color(t.foreground).child(`/${name}`))
         .child(div().flex_1().min_w(0).truncate().text_size(px(12)).text_color(t.dim).child(about))
         .when(opens(name), (el) => el.child(div().flex_none().text_size(px(10)).text_color(t.dim).child("opens in Terminal")))))
-      .child(div().px(8).pt(4).text_size(px(10)).text_color(t.dim).child("Enter runs · Tab or click fills in · ↑↓ · Esc"));
+      .child(div().px(8).pt(4).text_size(px(10)).text_color(t.dim)
+        .child(this.slash.start > 0 ? "Enter, Tab or click fills in · ↑↓ · Esc" : "Enter runs · Tab or click fills in · ↑↓ · Esc"));
   }
 
   // A paste with no text (an image): Claude reads the clipboard itself on its paste-image key
@@ -814,14 +862,54 @@ export default class ClaudeChat extends View {
   pasteImage(cx) {
     if (!this.address) return;
     const address = this.address;
+    if (this.where?.container) return this.pasteIntoContainer(address, this.where, cx);
     this.images = (this.images ?? 0) + 1;
     cx.spawn(async () => { await hc(["keys", address, /^win/.test(os.platform()) ? "alt+v" : "ctrl+v"]); });
     cx.notify();
   }
 
+  // A dev container's Claude runs on Linux with no clipboard (no X or Wayland, no xclip), so its
+  // paste key finds nothing. Instead the clipboard image is saved here as a PNG, copied into the
+  // container with `docker cp`, and its path goes with the next message (the way Herdr pastes an
+  // image into a terminal on another machine). That Claude runs with bypassPermissions, so it
+  // reads /tmp without asking. Windows only (the clipboard is read with .NET).
+  pasteIntoContainer(address, where, cx) {
+    if (!/^win/.test(os.platform())) { this.pasteNote = "Pasting images into a dev container needs Windows"; return cx.notify(); }
+    const name = `herdr-paste-${newUuid()}.png`;
+    this.pasteNote = "Copying the image into the container…";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      // The clipboard's image, else the first image file copied in Explorer. Exit 3 = no image.
+      const r = await exec("powershell", ["-NoProfile", "-STA", "-Command",
+        "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms, System.Drawing; " +
+        `$p = Join-Path $env:TEMP '${name}'; $img = [Windows.Forms.Clipboard]::GetImage(); ` +
+        "if (-not $img) { $f = [Windows.Forms.Clipboard]::GetFileDropList() | Where-Object { $_ -match '\\.(png|jpe?g|gif|webp|bmp)$' } | Select-Object -First 1; " +
+        "if (-not $f) { exit 3 }; $img = [Drawing.Image]::FromFile($f) }; " +
+        "$img.Save($p, [Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); " +
+        `docker cp $p '${where.container}:/tmp/${name}'; $c = $LASTEXITCODE; Remove-Item $p; exit $c`])
+        .catch((e) => ({ code: -1, stderr: String(e) }));
+      if (r.code === 0) {
+        this.pasted.set(address, [...(this.pasted.get(address) ?? []), `/tmp/${name}`]);
+        this.pasteNote = null;
+      } else {
+        this.pasteNote = r.code === 3 ? "No image on the clipboard" : `Couldn't copy the image: ${(r.stderr || `exit ${r.code}`).trim().slice(0, 200)}`;
+        cx.timer.after(6000, (cx) => { this.pasteNote = null; cx.notify(); });
+      }
+      cx.notify();
+    });
+  }
+
+  // How many images wait to go with the next message: in Claude's prompt, or (dev container)
+  // as files we hold.
+  imageCount(address) {
+    return this.where?.container ? (this.pasted.get(address)?.length ?? 0) : (this.images ?? 0);
+  }
+
   // Esc twice empties Claude's prompt, images and all (not while it's working: Esc stops it).
+  // A dev container's images were never in its prompt: just forget them.
   dropImages(cx) {
     const address = this.address;
+    if (this.where?.container) { this.pasted.delete(address); return cx.notify(); }
     this.images = 0;
     cx.spawn(async () => { await hc(["keys", address, "esc", "esc"]); });
     cx.notify();
@@ -1287,6 +1375,7 @@ export default class ClaudeChat extends View {
     // Built once each: they're shown only when there is one.
     const chips = this.subChips(t);
     const status = this.status(t, agent);
+    const images = this.imageCount(agent.address);
     const menu = this.menu(t);
     if (hidden > 0) rows.unshift(h_flex().w_full().justify_center().child(
       this.button(t, "earlier", `Show earlier (${hidden})`, (_e, cx) => { this.limit += PAGE; cx.notify(); })));
@@ -1314,11 +1403,13 @@ export default class ClaudeChat extends View {
       .child(font(v_flex()).flex_none().p(10).gap(8).border_t(1).border_color(t.border).bg(t.chrome)
         .when(Boolean(chips), (el) => el.child(chips))
         .when(Boolean(status), (el) => el.child(status))
-        .when(this.images > 0, (el) => el.child(h_flex().gap(8).items_center().px(4).text_size(px(12)).text_color(t.muted)
+        .when(Boolean(this.pasteNote), (el) => el.child(div().px(4).text_size(px(12)).text_color(t.muted).child(this.pasteNote)))
+        .when(images > 0, (el) => el.child(h_flex().gap(8).items_center().px(4).text_size(px(12)).text_color(t.muted)
           .child(div().px(8).py(2).rounded(6).bg(t.raised).text_color(t.foreground)
-            .child(this.images === 1 ? "🖼 1 image" : `🖼 ${this.images} images`))
-          .child(div().flex_1().min_w(0).truncate().child("in Claude's prompt, sent with your message"))
-          .when(agent.status !== "working", (el) => el.child(this.button(t, "drop-images", "Remove", (_e, cx) => this.dropImages(cx))))))
+            .child(images === 1 ? "🖼 1 image" : `🖼 ${images} images`))
+          .child(div().flex_1().min_w(0).truncate().child(this.where?.container
+            ? "copied into the container, sent with your message" : "in Claude's prompt, sent with your message"))
+          .when(Boolean(this.where?.container) || agent.status !== "working", (el) => el.child(this.button(t, "drop-images", "Remove", (_e, cx) => this.dropImages(cx))))))
         .when(Boolean(menu), (el) => el.child(menu))
         // Keys pass through here on their way up from the box: the menu takes ↑ ↓ Tab Esc.
         // No Send button: Enter sends (the placeholder says so).
@@ -1330,6 +1421,8 @@ export default class ClaudeChat extends View {
             else if (e.key === "up") this.menuAt = (this.menuAt + list.length - 1) % list.length;
             else if (e.key === "tab") this.complete(list[this.menuAt][0]);
             else if (e.key === "escape") this.menuOff = true;
+            // The caret moved off the word without a change event: close the menu.
+            else if (["left", "right", "home", "end"].includes(e.key)) this.slash = null;
             else return;
             cx.stop_propagation();
             cx.notify();
