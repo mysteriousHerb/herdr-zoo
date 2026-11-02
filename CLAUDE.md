@@ -29,6 +29,13 @@ Not in the repo, on purpose: `settings.json` (Herdr and the zoo's ♪ dialog bot
   125% (1520x807 client, 1900x1009 shot; seen 2026-11-02) divide shot pixels by 1.25. Check an
   overlay opened with `herdr-app status` (`overlays`): the shot didn't draw the ♪ dialog that time.
   Older notes saying "no CLI click" predate the script.
+- **Keys from the CLI**: `scripts/keys.ps1 -plan "ctrl v; wait 200; enter"` posts key presses to the
+  Herdr window, which needn't be in front (modifiers go into Herdr's keyboard state via
+  `AttachThreadInput`). They land wherever Herdr's keyboard focus is, like real keys. **Ask the user
+  first** and test in a scratch tab: on 2026-11-02 the user switched tabs mid-test and a Ctrl+A/Ctrl+X
+  cut their half-typed chat message. That test found the chat already handles Ctrl+V (paste into the
+  box), Ctrl+A/Ctrl+X in the box and Ctrl+C on a dragged message selection, so it needs no
+  Ctrl+Shift (that's only for terminals).
 - On Windows there is no bare `python`; run scripts with `uv run scripts/<x>.py` (PEP 723 deps).
 - **Speed** (measured 2026-10-30): mods run on Herdr's UI thread, so a slow script stalls the
   whole window. After ~50 min of deploys and layout switches the window held a core at 100% even
