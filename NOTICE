@@ -1,0 +1,29 @@
+herdr-zoo
+Copyright (c) 2026 Tian Zhao. Code licensed under the MIT License (see LICENSE).
+
+Third-party material
+--------------------
+
+Art and sound by Kenney (https://kenney.nl), CC0 1.0 Universal (public domain).
+Credit is not required; it is given anyway.
+  - Cube Pets, Blocky Characters, Mini Characters: rendered to the GIFs in
+    mods/zoo/packs/ by scripts/render_cube_pets.py and scripts/render_kenney.py.
+  - Music Jingles, Interface Sounds: converted to the jingle-*.mp3 and ui-*.mp3
+    files in mods/zoo/sounds/ by scripts/kenney_sounds.py.
+
+Herdr (https://herdr.dev)
+  These mods start from Herdr's own shipped mods, cloned with Herdr's `mod.clone`
+  and then changed:
+    mods/my-tabs       <- tabs
+    mods/my-pane       <- pane
+    mods/my-status     <- workspace-status
+    mods/my-new-menu   <- new-menu
+    mods/zoo-agents    <- agents
+  The layouts in layouts/ start from Herdr's `main` layout. Herdr and its shipped
+  mods belong to their authors; this project is not affiliated with Herdr.
+
+Our own
+  The tiles in mods/zoo/tiles/ (scripts/make_tiles.py) and the five synthesized
+  effects in mods/zoo/sounds/ (scripts/make_sounds.py: alert-blips, chime-up,
+  level-up, ping, two-tone) are original to this project and covered by the
+  MIT License.

@@ -1,0 +1,2 @@
+# Herdr writes CRLF on Windows; keep the repo LF.
+* text=auto eol=lf

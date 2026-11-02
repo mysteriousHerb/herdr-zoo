@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+
+# Hand-downloaded sprite pack zips (render_cube_pets.py, render_kenney.py read them)
+sprites/
+
+# Herdr writes these into every mod folder for editors (gpui-kit.d.ts says to ignore it)
+mods/*/gpui-kit.d.ts
+mods/*/jsconfig.json
+
+# Hand-downloaded Kenney sound zips (kenney_sounds.py reads them)
+/sounds/
+
+# Only shareable assets go in this repo: never commit ripped game audio or sprites.
+*.wav

@@ -1,0 +1,140 @@
+{
+ "id": "blocky",
+ "name": "Blocky",
+ "credit": "Blocky Characters by Kenney, kenney.nl (CC0)",
+ "files": {
+  "work": "mods/zoo/packs/blocky/{id}/work-1.gif",
+  "blocked": "mods/zoo/packs/blocky/{id}/blocked-1.gif",
+  "done": "mods/zoo/packs/blocky/{id}/done-1.gif",
+  "idle": "mods/zoo/packs/blocky/{id}/idle-1.gif"
+ },
+ "bob": false,
+ "sprites": [
+  {
+   "id": "a",
+   "name": "Ben",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "b",
+   "name": "Ruby",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "c",
+   "name": "Cal",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "d",
+   "name": "Hazmat",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "e",
+   "name": "Eli",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "f",
+   "name": "Finn",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "g",
+   "name": "Robot",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "h",
+   "name": "Robo",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "i",
+   "name": "Doctor",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "j",
+   "name": "Police",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "k",
+   "name": "Kat",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "l",
+   "name": "Zombie",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "m",
+   "name": "Max",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "n",
+   "name": "Nurse",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "o",
+   "name": "Orc",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "p",
+   "name": "Pat",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "q",
+   "name": "Agent",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "r",
+   "name": "Ninja",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  }
+ ]
+}

@@ -1,0 +1,182 @@
+{
+ "id": "cube-pets",
+ "name": "Cube Pets",
+ "credit": "Cube Pets by Kenney, kenney.nl (CC0)",
+ "files": {
+  "work": "mods/zoo/packs/cube-pets/{id}/walk-2.gif",
+  "blocked": "mods/zoo/packs/cube-pets/{id}/gesture-negative-2.gif",
+  "done": "mods/zoo/packs/cube-pets/{id}/gesture-positive-2.gif",
+  "idle": "mods/zoo/packs/cube-pets/{id}/idle-2.gif"
+ },
+ "bob": false,
+ "sprites": [
+  {
+   "id": "beaver",
+   "name": "Beaver",
+   "w": 53,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "bee",
+   "name": "Bee",
+   "w": 50,
+   "h": 56,
+   "tile": "sky"
+  },
+  {
+   "id": "bunny",
+   "name": "Bunny",
+   "w": 52,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "cat",
+   "name": "Cat",
+   "w": 46,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "caterpillar",
+   "name": "Caterpillar",
+   "w": 54,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "chick",
+   "name": "Chick",
+   "w": 56,
+   "h": 52,
+   "tile": "grass"
+  },
+  {
+   "id": "cow",
+   "name": "Cow",
+   "w": 56,
+   "h": 53,
+   "tile": "grass"
+  },
+  {
+   "id": "crab",
+   "name": "Crab",
+   "w": 56,
+   "h": 46,
+   "tile": "water"
+  },
+  {
+   "id": "deer",
+   "name": "Deer",
+   "w": 53,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "dog",
+   "name": "Dog",
+   "w": 56,
+   "h": 55,
+   "tile": "grass"
+  },
+  {
+   "id": "elephant",
+   "name": "Elephant",
+   "w": 48,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "fish",
+   "name": "Fish",
+   "w": 54,
+   "h": 56,
+   "tile": "water"
+  },
+  {
+   "id": "fox",
+   "name": "Fox",
+   "w": 55,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "giraffe",
+   "name": "Giraffe",
+   "w": 56,
+   "h": 52,
+   "tile": "grass"
+  },
+  {
+   "id": "hog",
+   "name": "Hog",
+   "w": 52,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "koala",
+   "name": "Koala",
+   "w": 56,
+   "h": 50,
+   "tile": "grass"
+  },
+  {
+   "id": "lion",
+   "name": "Lion",
+   "w": 50,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "monkey",
+   "name": "Monkey",
+   "w": 52,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "panda",
+   "name": "Panda",
+   "w": 56,
+   "h": 55,
+   "tile": "grass"
+  },
+  {
+   "id": "parrot",
+   "name": "Parrot",
+   "w": 54,
+   "h": 56,
+   "tile": "sky"
+  },
+  {
+   "id": "penguin",
+   "name": "Penguin",
+   "w": 56,
+   "h": 51,
+   "tile": "water"
+  },
+  {
+   "id": "pig",
+   "name": "Pig",
+   "w": 56,
+   "h": 54,
+   "tile": "grass"
+  },
+  {
+   "id": "polar",
+   "name": "Polar bear",
+   "w": 54,
+   "h": 56,
+   "tile": "grass"
+  },
+  {
+   "id": "tiger",
+   "name": "Tiger",
+   "w": 47,
+   "h": 56,
+   "tile": "grass"
+  }
+ ]
+}

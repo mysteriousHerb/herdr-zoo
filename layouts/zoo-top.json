@@ -1,0 +1,182 @@
+{
+  "id": "root",
+  "colors": {
+    "selection": "#4f7cff59",
+    "done": "#8a8f98"
+  },
+  "titlebar": "none",
+  "traffic_lights": [
+    12,
+    16
+  ],
+  "background": "canvas",
+  "terminal_padding": [
+    14,
+    12
+  ],
+  "divider": {
+    "width": 1,
+    "color": "border"
+  },
+  "type": "column",
+  "children": [
+    {
+      "id": "spaces-bar",
+      "type": "block",
+      "size": {
+        "px": 42
+      },
+      "window_drag": true,
+      "content": {
+        "mod": "zoo-spaces"
+      }
+    },
+    {
+      "id": "tabs",
+      "type": "block",
+      "size": {
+        "px": 42
+      },
+      "window_drag": true,
+      "content": {
+        "mod": "my-tabs",
+        "props": {
+          "buttons": false
+        }
+      }
+    },
+    {
+      "id": "zoo-wrap",
+      "type": "column",
+      "size": {
+        "px": 204
+      },
+      "min": 120,
+      "max": 400,
+      "padding": [
+        0,
+        8
+      ],
+      "children": [
+        {
+          "id": "zoo",
+          "type": "block",
+          "content": {
+            "mod": "zoo"
+          }
+        }
+      ]
+    },
+    {
+      "id": "work-body",
+      "type": "row",
+      "padding": 8,
+      "gap": 8,
+      "children": [
+        {
+          "id": "work",
+          "type": "stack",
+          "active": "chat",
+          "children": [
+            {
+              "id": "chat",
+              "title": "Chat",
+              "type": "block",
+              "radius": 10,
+              "border": {
+                "width": 1,
+                "color": "border"
+              },
+              "content": {
+                "mod": "claude-chat",
+                "props": {
+                  "stack": "work",
+                  "self": "chat",
+                  "other": "main"
+                }
+              }
+            },
+            {
+              "id": "main",
+              "title": "Terminal",
+              "type": "block",
+              "content": {
+                "tab": "active",
+                "pane": {
+                  "gap": 8,
+                  "radius": 10,
+                  "background": "background",
+                  "lone": true,
+                  "border": {
+                    "width": 1,
+                    "color": "border"
+                  },
+                  "focus": {
+                    "width": 1,
+                    "color": "accent"
+                  },
+                  "header": {
+                    "content": {
+                      "mod": "my-pane",
+                      "props": {
+                        "stack": "work",
+                        "other": "chat"
+                      }
+                    },
+                    "height": 30,
+                    "position": "top",
+                    "reveal": "always"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "panel",
+          "type": "column",
+          "hidden": true,
+          "size": {
+            "px": 368
+          },
+          "min": 280,
+          "max": 900,
+          "children": [
+            {
+              "id": "panel-body",
+              "type": "stack",
+              "active": "files",
+              "children": [
+                {
+                  "id": "files",
+                  "type": "block",
+                  "content": {
+                    "mod": "files"
+                  }
+                },
+                {
+                  "id": "changes",
+                  "type": "block",
+                  "content": {
+                    "mod": "changes"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "status",
+      "type": "block",
+      "size": {
+        "px": 28
+      },
+      "content": {
+        "mod": "my-status"
+      }
+    }
+  ],
+  "preview": "layouts/zoo-top.svg"
+}
