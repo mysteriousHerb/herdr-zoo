@@ -53,21 +53,20 @@ cd herdr-zoo
 sh scripts/deploy.sh        # Git Bash on Windows
 ```
 
-`deploy.sh` copies `layouts/`, `mods/` and `programs.json` into `~/.config/herdr-app/` (or
+`deploy.sh` copies `layouts/` and `mods/` into `~/.config/herdr-app/` (or
 `$HERDR_APP_HOME`) and runs `herdr-app check` on each mod. It only copies and never
 deletes. Herdr reloads within a second. Then switch layouts with **Ctrl+Shift+L** and pick
 **zoo**. Run `deploy.sh` again after a `git pull`.
 
-**Careful:** `programs.json` overwrites one you already have in `~/.config/herdr-app`. Merge
-it by hand if you have your own programs there.
+### Claude (dev container) (optional)
 
-### Claude (dev container)
-
-The + menu has a "Claude (dev container)" entry that runs
+The + menu can offer a "Claude (dev container)" entry that runs
 `devcontainer up` + `devcontainer exec … claude` on a `harness-agent` checkout next to the
-space's folder (`..\harness-agent`). The entry only appears when that folder exists. To
-point it at your own dev container, edit the `run` line in `programs.json`, and the matching
-`devcontainer exec` line in `mods/claude-chat/main.js` (used when forking a container chat).
+space's folder (`..\harness-agent`). It is off unless you turn it on, per computer: copy
+`programs.dev-container.json` to `~/.config/herdr-app/programs.json` (or merge its entry
+into the one you have). To turn it off again, remove that entry. To point it at your own
+dev container, edit its `run` line, and the matching `devcontainer exec` line in
+`mods/claude-chat/main.js` (used when forking a container chat).
 
 ## Status
 
