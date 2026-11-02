@@ -1,7 +1,7 @@
 // Clone of Herdr's `new-menu` (the + in the tab bar); only change: the agents it offers,
 // always these in this order (keys from knownAgents and programs.json), if installed.
 // "Claude (dev container)" is opt-in per computer: it shows only when that computer's own
-// programs.json defines `claude-dev-container` (see programs.dev-container.json). No folder
+// programs.json defines `claude-dev-container` (the chat's ⚙ adds or removes it). No folder
 // check here: an `exists` on every menu open slowed Herdr down.
 
 import { View, div, svg, image } from "gpui-kit";

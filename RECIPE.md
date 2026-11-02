@@ -160,10 +160,12 @@ Shipped mods used: `workspace-chrome` (brand, footer, icons), `spaces`, `files`,
 `confirm`, `menu`, `worktree`, `pane` (icons). Shared state: `zoo.sprites` (address → `pack/id`),
 `zoo.packs`, `zoo.sounds`, `zoo.volume`, `chat.look`, `chat.subs` (address → sub-agents at work).
 
-`programs.dev-container.json` defines `claude-dev-container` ("Claude (dev container)").
+`claude-dev-container` ("Claude (dev container)") is a `programs.json` entry.
 **Optional, per computer**: it runs a dev container from a `../harness-agent` checkout beside the
 space's folder, and the + menu shows it only when the computer's own `~/.config/herdr-app/programs.json`
-has that entry (deploy doesn't copy it; no folder check in the menu, that slowed Herdr down).
+has that entry (deploy doesn't copy that file; no folder check in the menu, that slowed Herdr down).
+On by default: `claude-chat` adds it on its first run on Windows (`DEV_ENTRY`), once; the chat's ⚙
+popup adds or removes it ("+ menu → Claude (dev container)"), and shared `chat.devContainer` keeps the choice.
 The chat reads a dev-container Claude's transcript through docker.
 
 **Art: reuse the files, don't redraw.** The creatures are Kenney's CC0 Cube Pets, Blocky
