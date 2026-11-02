@@ -1,3 +1,0 @@
-{ "programs": {
-    "claude-dev-container": { "name": "Claude (dev container)", "icon": "icons/claude.svg", "tint": false,
-      "run": ["cmd.exe", "/c", "devcontainer up --workspace-folder ..\\harness-agent && devcontainer exec --workspace-folder ..\\harness-agent claude"] } } }
