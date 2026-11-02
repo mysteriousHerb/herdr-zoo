@@ -23,7 +23,8 @@ be read and answered as a chat, next to its terminal.
   whole or from any of your messages. It works with local agents and with ones running
   in a dev container. A Chat / Terminal switch flips between it and the real terminal.
 - **Agents list** (`mods/zoo-agents`): Herdr's agents sidebar with each agent's creature as
-  its icon. The "Agents / Zoo" header switches between the list and the zoo.
+  its icon. The "Agents / Zoo" header switches between the list and the zoo, and both
+  headers have the ♪ sounds button.
 - **Tabs, pane header, status bar, + menu** (`my-tabs`, `my-pane`, `my-status`,
   `my-new-menu`): Herdr's own, with tweaks.
   - Tabs show the agent's creature and name.

@@ -463,16 +463,32 @@ export default class Agents extends View {
             .items_center()
             .justify_between()
             .child(viewSwitch(t, "list"))
-            .child(
-              div()
-                .id("ag-sort")
-                .text_size(11)
-                .text_color(t.dim)
-                .hover((s) => s.text_color(t.foreground))
-                .on_click(() => openOverlay({ mod: "zoo-agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
-                .tooltip(`Sort agents: ${sort.label}`)
-                .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
-            ),
+            .child(h_flex().gap(4).items_center().mr(-8)
+              .child(
+                div()
+                  .id("ag-sort")
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_click(() => openOverlay({ mod: "zoo-agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
+                  .tooltip(`Sort agents: ${sort.label}`)
+                  .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
+              )
+              // The zoo's sounds dialog, the same ♪ as in the zoo's header.
+              .child(
+                div()
+                  .id("ag-sounds")
+                  .px(8)
+                  .py(4)
+                  .rounded(6)
+                  .text_size(14)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .tooltip("Sounds")
+                  .on_click(() => openOverlay({ mod: "zoo", kind: "dialog", width: 560, height: 640, props: { sounds: true } }))
+                  .child("♪"),
+              )),
         ),
       )
       .when(list.length === 0 && !collapsed, (el) =>

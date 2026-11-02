@@ -19,7 +19,7 @@ readable), `done` `#8a8f98` (a calm gray in place of the theme's blue). Root bac
   - Spaces list (Herdr's `spaces`), weight 1, min 90px.
   - The **Zoo / Agents** area, weight 2, min 90px. Its 41px header reads "Agents  Zoo" (11.5px,
     medium; the one showing in `foreground`, the other `dim` and clickable) with a ♪ button (14px)
-    at the right on the Zoo side. Zoo shows by default.
+    at the right on both sides (on the Agents side after the sort button). Zoo shows by default.
     - **Zoo**: pens wrap two to a row (each 122px wide, rounded 12, 8px vertical padding) and the
       area scrolls down. Each pen, top to bottom: a speech bubble (22px tall, radius 11, max 120px,
       11px semibold), the creature (scaled to fit 110×68 and at most 1.5×, so most are 68px tall)
