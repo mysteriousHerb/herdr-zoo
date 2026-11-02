@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
-# Copy this repo's layouts, mods and programs.json into Herdr's folder; Herdr hot-reloads them.
+# Copy this repo's layouts and mods into Herdr's folder; Herdr hot-reloads them.
 # Only copies: it never deletes (remove files there by hand when they go from the repo).
+# programs.json is per computer and not copied: see programs.dev-container.json.
 set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 home=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
 
 mkdir -p "$home/layouts" "$home/mods"
 cp "$repo"/layouts/* "$home/layouts/"
-cp "$repo"/programs.json "$home/"
 for mod in "$repo"/mods/*/; do
   name=$(basename "$mod")
   mkdir -p "$home/mods/$name"

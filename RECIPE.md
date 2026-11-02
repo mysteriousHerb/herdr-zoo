@@ -19,7 +19,7 @@ readable), `done` `#8a8f98` (a calm gray in place of the theme's blue). Root bac
   - Spaces list (Herdr's `spaces`), weight 1, min 90px.
   - The **Zoo / Agents** area, weight 2, min 90px. Its 41px header reads "Agents  Zoo" (11.5px,
     medium; the one showing in `foreground`, the other `dim` and clickable) with a ♪ button (14px)
-    at the right on the Zoo side. Zoo shows by default.
+    at the right on both sides (on the Agents side after the sort button). Zoo shows by default.
     - **Zoo**: pens wrap two to a row (each 122px wide, rounded 12, 8px vertical padding) and the
       area scrolls down. Each pen, top to bottom: a speech bubble (22px tall, radius 11, max 120px,
       11px semibold), the creature (scaled to fit 110×68 and at most 1.5×, so most are 68px tall)
@@ -160,9 +160,11 @@ Shipped mods used: `workspace-chrome` (brand, footer, icons), `spaces`, `files`,
 `confirm`, `menu`, `worktree`, `pane` (icons). Shared state: `zoo.sprites` (address → `pack/id`),
 `zoo.packs`, `zoo.sounds`, `zoo.volume`, `chat.look`, `chat.subs` (address → sub-agents at work).
 
-`programs.json` adds `claude-dev-container` ("Claude (dev container)"). **Optional**: it runs a
-dev container from a `../harness-agent` checkout beside the space's folder, and the + menu hides it
-when that folder is missing. The chat reads a dev-container Claude's transcript through docker.
+`programs.dev-container.json` defines `claude-dev-container` ("Claude (dev container)").
+**Optional, per computer**: it runs a dev container from a `../harness-agent` checkout beside the
+space's folder, and the + menu shows it only when the computer's own `~/.config/herdr-app/programs.json`
+has that entry (deploy doesn't copy it; no folder check in the menu, that slowed Herdr down).
+The chat reads a dev-container Claude's transcript through docker.
 
 **Art: reuse the files, don't redraw.** The creatures are Kenney's CC0 Cube Pets, Blocky
 Characters and Mini Characters, pre-rendered to GIFs in `mods/zoo/packs/<pack>/<id>/` (one per
@@ -200,7 +202,6 @@ original effects) and `mods/zoo/silent.mp3`. A rebuild copies all of these as th
 - A fresh `--fork-session` copy has no transcript until its first new message ("No transcript
   yet"). Fork copies are written into `~/.claude/projects`.
 - Never display a dev-container Claude's process command line: it carries the container's env.
-- `programs.json` replaces one the person already has; merge by hand.
 - Reaches outside its folder: reads `~/.claude`, writes `settings.json`, runs `git`, `gh`
   (network), `powershell`/`ps`, `docker`, `code`, `claude`.
 

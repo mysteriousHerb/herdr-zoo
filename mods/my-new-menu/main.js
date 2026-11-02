@@ -1,10 +1,10 @@
 // Clone of Herdr's `new-menu` (the + in the tab bar); only change: the agents it offers,
 // always these in this order (keys from knownAgents and programs.json), if installed.
-// "Claude (dev container)" runs in ../harness-agent beside the space's folder, so it is
-// offered only where that folder exists (other people don't get a broken entry).
+// "Claude (dev container)" is opt-in per computer: it shows only when that computer's own
+// programs.json defines `claude-dev-container` (see programs.dev-container.json). No folder
+// check here: an `exists` on every menu open slowed Herdr down.
 
 import { View, div, svg, image } from "gpui-kit";
-import { exists } from "fs/promises";
 import { h_flex, v_flex } from "gpui-base";
 import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window } from "herdr";
 
@@ -17,9 +17,6 @@ export default class NewMenu extends View {
       const space = spaces().find(s => s.active);
       try { this.agents = await knownAgents({ on: space?.machine }); }
       catch { this.failed = true; }
-      // Another machine's folders can't be checked from here: keep the entry there.
-      this.devContainer = space?.machine ? true
-        : Boolean(space?.folder) && await exists(`${space.folder}/../harness-agent`).catch(() => false);
       cx.notify();
     });
   }
@@ -34,8 +31,7 @@ export default class NewMenu extends View {
     const t = theme();
     const space = spaces().find(s => s.active);
     const order = ["claude", "claude-dev-container", "codex", "opencode"];
-    const installed = order.filter(k => k !== "claude-dev-container" || this.devContainer)
-      .map(k => this.agents.find(a => a.key === k && a.installed)).filter(Boolean);
+    const installed = order.map(k => this.agents.find(a => a.key === k && a.installed)).filter(Boolean);
     const choices = installed;
     const mod = window()?.platform === "macos" ? "⌘" : "Ctrl";
     return v_flex().min_h(0).w_full().h(Math.min(491, 167 + Math.max(1, choices.length) * 31)).bg(t.popover).p(5).text_size(12.8)
