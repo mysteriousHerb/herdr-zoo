@@ -58,38 +58,15 @@
               }
             },
             {
-              "id": "agents",
-              "type": "stack",
+              "id": "agents-list",
+              "type": "block",
               "size": {
                 "weight": 2
               },
               "min": 90,
-              "active": "agents-zoo",
-              "children": [
-                {
-                  "id": "agents-list",
-                  "type": "block",
-                  "content": {
-                    "mod": "zoo-agents",
-                    "props": {
-                      "stack": "agents",
-                      "other": "agents-zoo"
-                    }
-                  }
-                },
-                {
-                  "id": "agents-zoo",
-                  "type": "block",
-                  "content": {
-                    "mod": "zoo",
-                    "props": {
-                      "side": true,
-                      "stack": "agents",
-                      "other": "agents-list"
-                    }
-                  }
-                }
-              ]
+              "content": {
+                "mod": "zoo-agents"
+              }
             }
           ]
         },
