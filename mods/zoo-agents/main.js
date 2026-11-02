@@ -202,6 +202,62 @@ export default class Agents extends View {
     run("terminal.peek", { terminal: addr });
   }
 
+  // Drag to reorder, as Herdr's spaces list does it (press, move, release; no drag API).
+  // `key` names this element; `me` is what pressing it drags ({kind, pos, ...}) or null;
+  // `aim(drag)` is where that drag lands with the pointer here ({key, pos, drop}) or null.
+  // The accent line is drawn on the landing element, under it when moving down.
+  dnd(el, t, key, me, aim) {
+    const d = this.drag;
+    const o = this.over;
+    return el
+      .relative()
+      .when(Boolean(d && d.key === key && o && o.key !== key), (el) => el.opacity(0.5))
+      .when(Boolean(d && o && o.key === key && d.key !== key), (el) => el.child(
+        div().absolute().left(0).right(0).h(2).rounded(1).bg(t.accent)
+          .when(d.pos < o.pos, (line) => line.bottom(0))
+          .when(d.pos > o.pos, (line) => line.top(0)),
+      ))
+      .when(Boolean(me), (el) => el.on_mouse_down("left", () => {
+        this.drag = { key, ...me };
+        this.over = null;
+      }))
+      .on_mouse_move((_e, cx) => {
+        if (!this.drag) return;
+        const over = aim(this.drag);
+        if ((over?.key ?? null) !== (this.over?.key ?? null)) {
+          this.over = over;
+          cx.notify();
+        }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        const from = this.drag;
+        const over = from && aim(from);
+        this.drag = null;
+        this.over = null;
+        if (over && over.key !== from.key) over.drop(from);
+        cx.notify();
+      });
+  }
+
+  endDrag(cx) {
+    if (!this.drag && !this.over) return;
+    this.drag = null;
+    this.over = null;
+    cx.notify();
+  }
+
+  // Where a dragged space header lands with the pointer on space `id`'s header or rows:
+  // spaces move only within their machine (space.move).
+  spaceAim(id) {
+    return (d) => {
+      if (d.kind !== "space") return null;
+      const sp = spaces();
+      const i = sp.findIndex((s) => s.id === id);
+      if (i < 0 || (sp[i].machine ?? null) !== d.machine) return null;
+      return { key: `sp-${id}`, pos: i, drop: (d) => run("space.move", { id: d.id, index: i + 1 }) };
+    };
+  }
+
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
   tree(all, addr, lead = []) {
     const kids = all.filter((k) => k.parent === addr && k.state === "live");
@@ -272,6 +328,14 @@ export default class Agents extends View {
     const rest = list.filter((a) => !this.pins.includes(a.address));
     list = [...pinned, ...rest];
     setAgentOrder(list.map((a) => a.address));
+
+    // Puts pin `from` where `to` is (after it when moving down); pins not shown keep their place at the end.
+    const movePin = (from, to) => {
+      const shown = pinned.map((a) => a.address);
+      const order = shown.filter((p) => p !== from);
+      order.splice(shown.indexOf(to), 0, from);
+      this.setPins([...order, ...this.pins.filter((p) => !shown.includes(p))]);
+    };
 
     const withKids = (a, i) => {
       const subs = collapsed ? [] : this.tree(all, a.address);
@@ -366,7 +430,23 @@ export default class Agents extends View {
       const full = byPriority || isPinned;
       const both = full && Boolean(more) && Boolean(a.space_name);
       const name = both ? more : full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
-      return h_flex()
+      // Dragging: pinned rows reorder the pins; under a space header a row moves its tab
+      // within the space (the tab bar follows); rows in priority sections stay put.
+      const pinAt = pinned.indexOf(a);
+      const spaceTabs = spaces().find((s) => s.id === a.space)?.tabs ?? [];
+      const tabAt = spaceTabs.findIndex((x) => x.id === a.tab);
+      const me = isPinned ? { kind: "pin", pos: pinAt }
+        : !byPriority && tabAt >= 0 ? { kind: "tab", pos: tabAt, space: a.space, tab: a.tab }
+        : null;
+      const onSpace = this.spaceAim(a.space);
+      const aim = (d) => {
+        if (d.kind === "pin" && isPinned) return { key: a.address, pos: pinAt, drop: (d) => movePin(d.key, a.address) };
+        if (d.kind === "tab" && !isPinned && !byPriority && d.space === a.space && d.tab !== a.tab && tabAt >= 0) {
+          return { key: a.address, pos: tabAt, drop: (d) => run("tab.move", { id: d.tab, index: tabAt + 1 }) };
+        }
+        return !isPinned && !byPriority ? onSpace(d) : null;
+      };
+      return this.dnd(h_flex(), t, a.address, me, aim)
         .id(`ag-${a.address}`)
         .px(8)
         .h(30)
@@ -396,7 +476,13 @@ export default class Agents extends View {
           })).child(pic)))
         .child(h_flex().flex_1().min_w(0).gap(5).items_center()
           .child(div().when(both, el => el.min_w(0)).when(!both, el => el.flex_none().max_w(200)).truncate().text_color(idle ? t.muted : t.foreground).child(name))
-          .when(both, el => el.child(div().flex_none().max_w(110).truncate().text_color(t.dim).child(`\u00b7 ${a.space_name}`))))
+          // Right-click the space name: rename the space (Herdr asks for the name).
+          .when(both, el => el.child(div().id(`ag-space-${a.address}`).flex_none().max_w(110).truncate().text_color(t.dim)
+            .on_mouse_down("right", (_e, cx) => {
+              cx.stop_propagation();
+              run("space.rename", { id: a.space });
+            })
+            .child(`\u00b7 ${a.space_name}`))))
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
@@ -411,14 +497,21 @@ export default class Agents extends View {
       const r = rankOf(a) || RANK.idle;
       const id = byPriority ? `sec-${r}` : `sp-${a.space}`;
       if (groups.at(-1)?.id === id) groups.at(-1).members.push(a);
-      else groups.push({ id, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
+      else groups.push({ id, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a], space: byPriority ? null : a.space });
     }
 
     // A group's header; it folds the group. Folded, it says how many and the most urgent state.
+    // A space's header drags to reorder the spaces; right-click renames the space.
     const header = (g) => {
       const open = !this.folded.has(g.id);
       const top = g.members.reduce((m, a) => ((RANK[a.status] ?? 0) > (RANK[m] ?? 0) ? a.status : m), null);
-      return h_flex()
+      const sp = g.space ? spaces() : [];
+      const at = sp.findIndex((s) => s.id === g.space);
+      const el = g.space && at >= 0
+        ? this.dnd(h_flex(), t, g.id, { kind: "space", pos: at, id: g.space, machine: sp[at].machine ?? null }, this.spaceAim(g.space))
+          .on_mouse_down("right", () => run("space.rename", { id: g.space }))
+        : h_flex();
+      return el
         .id(g.id)
         .px(8)
         .pt(8)
@@ -494,7 +587,11 @@ export default class Agents extends View {
       .when(list.length === 0 && !collapsed, (el) =>
         el.child(div().px(12).text_size(12).text_color(t.dim).child("No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
       )
-      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(rows))
+      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always")
+        // A drag ends on any release, and when the pointer leaves the list (a release out there never arrives).
+        .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+        .on_hover((on, cx) => { if (!on) this.endDrag(cx); })
+        .children(rows))
       .child(
         h_flex()
           .h(28)
