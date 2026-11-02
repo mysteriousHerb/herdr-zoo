@@ -1,5 +1,5 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
-// A viewed done agent stays in Done until left.
+// Unread = Herdr's done; done = finished and seen (zoo.turns). A viewed unread agent stays in Unread until left.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
@@ -41,7 +41,41 @@ function title(tab, l) {
   const telling = live && live !== prog && !/^[~/]|^[A-Za-z]:\\/.test(live) && !live.includes("@") && live.toLowerCase() !== l?.program?.key;
   return tab.name === prog && telling ? live : tab.name;
 }
-const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
+// Unread vs done. Herdr's "done" = finished while you weren't looking, and it turns "idle" once
+// you look, so a finished agent you've read looked like one that never did anything. Worse, Herdr
+// only counts looking at the terminal: with the Chat view in front an agent stays "done" while you
+// read it. So shared "zoo.turns" = { address: "run" | "seen" }: "run" once it works (a turn is on
+// or its result is unread), "seen" when it's done and the agent shown (focused().agent) with the
+// window active. Shown: done + seen, or idle after any turn = "done"; Herdr's done otherwise =
+// "unread"; idle with no turn yet = "idle". Copied in my-tabs: keep them in step.
+const machineOf = (addr) => (addr.includes("/") ? addr.split("/")[0] : "");
+function trackTurns(list, all) {
+  const was = shared("zoo.turns") ?? {};
+  let next = null;
+  const set = (k, v) => { if (was[k] !== v) (next ??= { ...was })[k] = v; };
+  const looking = window()?.active ? focused()?.agent : null;
+  for (const a of list) {
+    if (a.status === "working" || a.status === "blocked") set(a.address, "run");
+    else if (a.status === "done" && a.address === looking) set(a.address, "seen");
+  }
+  // Ended terminals go, but only on machines heard from (none are listed right after a start).
+  const heard = new Set(all.map((k) => machineOf(k.address)));
+  const live = new Set(all.filter((k) => k.state === "live").map((k) => k.address));
+  for (const k of Object.keys(next ?? was)) if (heard.has(machineOf(k)) && !live.has(k)) delete (next ??= { ...was })[k];
+  if (next) setShared("zoo.turns", next);
+}
+// The status shown: unread / done (seen) / Herdr's other words.
+function shownStatus(a) {
+  const v = shared("zoo.turns")?.[a.address];
+  if (a.status === "done") return v === "seen" ? "done" : "unread";
+  if (a.status === "idle") return v ? "done" : "idle";
+  return a.status;
+}
+const tone = (t, s) => (s === "unread" ? t.accent : t[s]);
+// The character's animation for a shown status: unread nods (Herdr's done), read ones idle.
+const ANIM = { unread: "done", done: "idle" };
+
+const RANK = { blocked: 5, unread: 4, working: 3, done: 2, idle: 1 };
 // A sub-agent without a pane isn't in agents(): its raw word, error counting as
 // blocked. It's never done: it reports to its parent, and the parent's done is the news.
 const kidStatus = (k, listed) => {
@@ -53,8 +87,8 @@ const SORTS = [
   { id: "grouped", label: "Grouped by space", icon: "layers" },
 ];
 const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[0];
-const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1: "Idle" };
-const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
+const SECTION = { 5: "Needs you", 4: "Unread", 3: "Working", 2: "Done", 1: "Idle" };
+const SECTION_STATUS = { 5: "blocked", 4: "unread", 3: "working", 2: "done" };
 
 function duration(ms) {
   const m = Math.floor(ms / 60000);
@@ -161,18 +195,21 @@ export default class Agents extends View {
     return this.changed[a.address]?.at ?? 0;
   }
 
-  // Looking at a done agent makes it idle; it stays with Done until you leave
+  // Looking at an unread agent makes it done; it stays with Unread until you leave
   // it rather than drop away under you. Any other change moves it at once.
+  // Runs before trackTurns, so arriving still sees it unread.
   hold(list) {
     const cur = list.find((a) => a.focused);
     const same = cur && cur.address === this.held?.address;
-    // Arriving, or any change but done turning idle, sets what it was.
-    if (!same || cur.status !== "idle") this.held = cur ? { address: cur.address, rank: RANK[cur.status] ?? 0 } : null;
+    const s = cur && shownStatus(cur);
+    // Arriving, or any change but unread turning done, sets what it was.
+    if (!same || !(this.held.rank === RANK.unread && s === "done")) this.held = cur ? { address: cur.address, rank: RANK[s] ?? 0 } : null;
   }
 
   rank(a) {
-    const sawDone = a.address === this.held?.address && this.held.rank === RANK.done && a.status === "idle";
-    return sawDone ? RANK.done : RANK[a.status] ?? 0;
+    const s = shownStatus(a);
+    const sawUnread = a.address === this.held?.address && this.held.rank === RANK.unread && s === "done";
+    return sawUnread ? RANK.unread : RANK[s] ?? 0;
   }
 
   sortMenu(t) {
@@ -299,15 +336,16 @@ export default class Agents extends View {
       .child(this.status(t, { status: st }, compact));
   }
 
-  // compact: a ! for blocked where a header already says "Needs you".
+  // compact: a ! for blocked where a header already says "Needs you". `a.status` is a shown status
+  // (shownStatus: unread / done are ours).
   status(t, a, compact = false) {
-    const color = t[a.status] ?? t.dim;
     if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
     if (a.status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
-    // Idle: a ring; done: a dot.
+    // Idle: a ring; unread: a dot; done (seen): a tick.
     if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
-    return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "done" ? color : t.dim + "00");
+    if (a.status === "done") return svg("mods/workspace-chrome/check.svg").size(12).mx(1).flex_none().text_color(t.done ?? t.dim);
+    return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "unread" ? tone(t, "unread") : t.dim + "00");
   }
 
   render(cx) {
@@ -322,6 +360,7 @@ export default class Agents extends View {
     const now = Date.now();
     this.track(list, now);
     this.hold(list);
+    trackTurns(list, all);
     const byPriority = sort.id === "priority";
     const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(all, a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
     const rankOf = (a) => urgency.get(a.address);
@@ -389,7 +428,7 @@ export default class Agents extends View {
     }
 
     const row = (a, i, subs = []) => {
-      const pic = creature(a.address, 24, a.status);
+      const pic = creature(a.address, 24, ANIM[shownStatus(a)] ?? a.status);
       const more = detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
       const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
@@ -404,7 +443,7 @@ export default class Agents extends View {
           .hover((s) => s.bg(t.hover))
           .on_click(() => run("pane.focus", { pane: a.pane }))
           .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(t.muted).child(String(i + 1)))
-          .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.status(t, a, true)));
+          .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.status(t, { status: shownStatus(a) }, true)));
       }
       const when = this.since(a);
       const idle = a.status === "idle" && !a.focused;
@@ -490,7 +529,7 @@ export default class Agents extends View {
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
-        .child(this.status(t, a, byPriority && !isPinned));
+        .child(this.status(t, { status: shownStatus(a) }, byPriority && !isPinned));
     };
 
     // Groups in list order: spaces (grouped) or priority sections. Agents of a
@@ -507,7 +546,7 @@ export default class Agents extends View {
     // A space's header drags to reorder the spaces; right-click renames the space.
     const header = (g) => {
       const open = !this.folded.has(g.id);
-      const top = g.members.reduce((m, a) => ((RANK[a.status] ?? 0) > (RANK[m] ?? 0) ? a.status : m), null);
+      const top = g.members.map(shownStatus).reduce((m, s) => ((RANK[s] ?? 0) > (RANK[m] ?? 0) ? s : m), null);
       const sp = g.space ? spaces() : [];
       const at = sp.findIndex((s) => s.id === g.space);
       const el = g.space && at >= 0
@@ -530,7 +569,7 @@ export default class Agents extends View {
           open ? this.folded.add(g.id) : this.folded.delete(g.id);
           cx.notify();
         })
-        .child(div().truncate().text_color(t[g.status] ?? t.dim).child(g.label))
+        .child(div().truncate().text_color(tone(t, g.status) ?? t.dim).child(g.label))
         .when(byPriority || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
         .child(div().flex_1())
         .when(!open, (el) => el

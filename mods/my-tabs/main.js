@@ -4,7 +4,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, agents, run, openOverlay, theme, window, shared, layout, settings, props } from "herdr";
+import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props } from "herdr";
 import PACKS from "./sprites.js";
 
 // Every sprite by key "<pack>/<id>" (sprites.js, the zoo's catalog; scripts/make_packs.py).
@@ -26,7 +26,8 @@ function creature(a, box) {
   }
   const s = BY.get(key);
   const scale = box / Math.max(s.w, s.h);
-  const file = (s.pack.files[STATE[a.status] ?? "work"] ?? s.pack.files.done).replace("{id}", s.id);
+  const st = shownStatus(a);
+  const file = (s.pack.files[STATE[ANIM[st] ?? st] ?? "work"] ?? s.pack.files.done).replace("{id}", s.id);
   return h_flex().w(box).h(box).flex_none().items_center().justify_center()
     .child(image(file).w(Math.round(s.w * scale)).h(Math.round(s.h * scale)));
 }
@@ -43,6 +44,34 @@ function tabName(c, lead) {
   if ((auto || c.name === prog) && telling) return live;
   return auto ? prog ?? "Terminal" : c.name;
 }
+
+// Unread vs done: shared "zoo.turns" = { address: "run" | "seen" }; Herdr's done = unread until
+// the agent is shown with the window active (the Chat view hides the terminal, so Herdr never
+// sees you read it), idle after a turn = done. Copied from zoo-agents (the why is there): keep them in step.
+const machineOf = (addr) => (addr.includes("/") ? addr.split("/")[0] : "");
+function trackTurns(list, all) {
+  const was = shared("zoo.turns") ?? {};
+  let next = null;
+  const set = (k, v) => { if (was[k] !== v) (next ??= { ...was })[k] = v; };
+  const looking = window()?.active ? focused()?.agent : null;
+  for (const a of list) {
+    if (a.status === "working" || a.status === "blocked") set(a.address, "run");
+    else if (a.status === "done" && a.address === looking) set(a.address, "seen");
+  }
+  const heard = new Set(all.map((k) => machineOf(k.address)));
+  const live = new Set(all.filter((k) => k.state === "live").map((k) => k.address));
+  for (const k of Object.keys(next ?? was)) if (heard.has(machineOf(k)) && !live.has(k)) delete (next ??= { ...was })[k];
+  if (next) setShared("zoo.turns", next);
+}
+function shownStatus(a) {
+  const v = shared("zoo.turns")?.[a.address];
+  if (a.status === "done") return v === "seen" ? "done" : "unread";
+  if (a.status === "idle") return v ? "done" : "idle";
+  return a.status;
+}
+const RANK = { blocked: 5, unread: 4, working: 3, done: 2, idle: 1 };
+// The character's animation for a shown status: unread nods (Herdr's done), read ones idle.
+const ANIM = { unread: "done", done: "idle" };
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -110,6 +139,7 @@ export default class Tabs extends View {
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
     const stop = (_e, cx) => cx.stop_propagation();
+    trackTurns(agents(), terminals());
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const item = (c, i) => {
@@ -117,6 +147,8 @@ export default class Tabs extends View {
       const program = lead?.program;
       const name = tabName(c, lead);
       const mine = agents().filter(a => a.tab === c.id), agent = mine.find(a => a.focused) ?? mine[0];
+      // The tab's status: its most urgent agent's shown one (terminal-only tabs: Herdr's).
+      const st = mine.length ? mine.map(shownStatus).reduce((m, s) => ((RANK[s] ?? 0) > (RANK[m] ?? 0) ? s : m)) : c.status === "done" ? "unread" : c.status;
       // Chrome-style: a tab is as wide as its content (up to 200, active 240) and the others
       // shrink together as tabs are added, down to the character (+ status); the active one keeps its name.
       return h_flex().id(`tab-${c.id}`).h(29).px(8).gap(6).rounded(7).items_center().overflow_hidden()
@@ -138,8 +170,10 @@ export default class Tabs extends View {
         .when(Boolean(agent), el => el.child(creature(agent, 20)))
         .when(!agent && Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).flex_none().text_color(t.muted) : image(program.icon).size(14).flex_none()))
         .child(div().flex_1().min_w(0).truncate().child(c.zoomed ? `${name} Z` : name))
-        .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-        .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).flex_none().rounded(3).bg(t[c.status])))
+        .when(st === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
+        // Blocked and unread: a dot; finished and read: a gray tick.
+        .when(st === "blocked" || st === "unread", el => el.child(div().size(6).flex_none().rounded(3).bg(st === "unread" ? t.accent : t.blocked)))
+        .when(st === "done", el => el.child(svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(t.done ?? t.dim)))
         .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); this.close(c, name, space); }).child(svg("mods/pane/close.svg").size(12))));
     };
     const root = layout(), sidebar = find(root, "sidebar"), w = window();

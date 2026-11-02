@@ -88,6 +88,18 @@ Not in the repo, on purpose: `settings.json` (Herdr and the zoo's ♪ dialog bot
   Cube Pets, the user's pick 2026-11-01: cutest and all one size; while `zoo.packs` is unset,
   `assign` sets it and moves agents from other packs to Cube Pets, once); picking one another agent has swaps them. A sprite key whose pack is gone counts as
   unassigned, so that agent gets a new one.
+- **Unread vs done** (2026-11-02, agents list and tabs only): Herdr's `done` means unread
+  (finished while you weren't looking) and turns `idle` once you look, so a read agent looked
+  like a fresh one. Worse, Herdr only counts looking at the terminal: with the Chat view in front
+  an agent stays `done` while you read it (seen: the focused `t32` was `done` in `hc ls`, and there's
+  no command to mark it seen). So shared `zoo.turns` = `{ "<address>": "run" | "seen" }`
+  (`trackTurns`, in `zoo-agents` and `my-tabs`, kept in step): `run` while working/blocked, `seen`
+  when it is `done` and `focused().agent` with `window().active`. Shown (`shownStatus`): **unread**
+  = Herdr's done not yet seen (accent dot; the character keeps its done nod), **done** = seen, or
+  idle after any turn (gray ✓; idle animation), **idle** = no turn yet (ring). Priority sections:
+  Needs you > Unread > Working > Done > Idle; an unread agent you open stays in Unread until you
+  leave it (`hold`). Seen by screenshot. Not changed: the zoo strip (`zoo-top`), the board, the
+  sounds and Herdr's own spaces dots still go by Herdr's `done`.
 - **Sounds**: shared state `zoo.sounds` = `{ blocked, done }`, each `chime` | `silent` |
   `file:<name>.mp3` (an old saved `cry` reads as `chime`). **Herdr 0.1.9 ignores `settings.json` `sounds.done`/`blocked`**
   (always its chime; verified 2026-10-30 by recording system audio with a WASAPI loopback,
