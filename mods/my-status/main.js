@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { h_flex, v_flex } from "gpui-base";
+import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import os from "os";
 import { readdir, exists } from "fs/promises";
 import { spaces, agents, panes, focused, theme, run, window, shared, exec, notify, openOverlay, closeOverlay, props, appHome } from "herdr";
@@ -166,6 +166,23 @@ async function reposIn(root) {
   return found;
 }
 
+// A repo's page: its top folder, local branches (most recent first), uncommitted changes and
+// how many agents work in it. null when it isn't a repo.
+async function branchInfo(folder) {
+  const git = (...args) => exec("git", args, { cwd: folder }).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+  const [top, refs, status] = await Promise.all([
+    git("rev-parse", "--show-toplevel"),
+    git("for-each-ref", "--sort=-committerdate", "--format=%(HEAD)|%(refname:short)|%(committerdate:relative)", "refs/heads"),
+    git("-c", "core.filemode=false", "status", "--porcelain"),
+  ]);
+  if (top.code) return null;
+  const root = resolvePath(top.stdout.trim()); // git says C:/x; the bar's folders are C:\x
+  const branches = refs.stdout.trim().split("\n").filter(Boolean).map((l) => { const [head, name, when] = l.split("|"); return { name, when, current: head === "*" }; });
+  const agentsHere = panes().filter((p) => p.status && p.cwd && inside(p.cwd, root)).length;
+  const dirty = status.stdout.trim().split("\n").filter(Boolean).length;
+  return { root, branches, agentsHere, dirty };
+}
+
 const ROW = 34; // a repo row's height in the repos popup
 
 export default class WorkspaceStatus extends View {
@@ -173,7 +190,12 @@ export default class WorkspaceStatus extends View {
     this.prs = {}; // "<folder>|<branch>" → { pr, error?, at }
     this.syncing = new Set(); // folders being synced
     const p = props() ?? {};
-    if (p.branches) return;
+    if (p.repo) {
+      // "+ New branch": a name box (shown on click), Enter = `git switch -c <name>` from the current branch.
+      this.newBox = InputState.new({ placeholder: "New branch name, Enter to create" });
+      this.newBox.on("submit", (_e, cx) => this.createBranch(cx));
+      return this.initRepos({ dirs: [p.repo.dir], status: p.repo.status, prs: p.repo.prs }, cx);
+    }
     if (p.repos) return this.initRepos(p.repos, cx);
     this.git = {}; // folder -> { branch, upstream, ahead, behind, dirty } | null (not a repo)
     this.boxes = []; // devContainers()
@@ -285,7 +307,8 @@ export default class WorkspaceStatus extends View {
     });
   }
 
-  // The repos popup: its own reads while open (statuses every 4 s, PRs on open and every minute).
+
+  // A popup's own reads while open (statuses every 4 s, PRs on open and every minute).
   initRepos(ws, cx) {
     this.repos = { ...(ws.status ?? {}) };
     this.prs = { ...(ws.prs ?? {}) };
@@ -298,7 +321,7 @@ export default class WorkspaceStatus extends View {
         const changed = ws.dirs.some((d, i) => JSON.stringify(this.repos[d] ?? null) !== JSON.stringify(got[i]));
         ws.dirs.forEach((d, i) => { this.repos[d] = got[i]; });
         if (changed) cx.notify();
-        if (Date.now() - (this.prsAt ?? 0) > 60000) this.readPrs(ws, cx);
+        if (Date.now() - (this.prsAt ?? 0) > 60000) this.readPrs(ws.dirs, cx);
       });
     };
     this.reread = read;
@@ -306,12 +329,12 @@ export default class WorkspaceStatus extends View {
     cx.timer.every(4000, read);
   }
 
-  readPrs(ws, cx, force) {
+  readPrs(dirs, cx, force) {
     if (this.lookingUp && !force) return;
     this.lookingUp = true;
     this.prsAt = Date.now();
     cx.spawn(async (cx) => {
-      const list = ws.dirs.filter((d) => this.repos[d]?.branch).map((d) => ({ folder: d, branch: this.repos[d].branch, oid: this.repos[d].oid }));
+      const list = dirs.filter((d) => this.repos[d]?.branch).map((d) => ({ folder: d, branch: this.repos[d].branch, oid: this.repos[d].oid }));
       const got = await prsFor(list);
       for (const [k, v] of Object.entries(got)) this.prs[k] = { ...v, at: Date.now() };
       this.lookingUp = false;
@@ -319,53 +342,77 @@ export default class WorkspaceStatus extends View {
     });
   }
 
-  openRepos(ws, above) {
+  // The known PRs and statuses of some repos, to hand to the next popup so it shows them at once.
+  handOver(dirs) {
+    const status = {}, prs = {};
+    for (const d of dirs) {
+      const st = this.repos?.[d] ?? this.git?.[d];
+      if (!st) continue;
+      status[d] = st;
+      const k = `${d}|${st.branch}`;
+      if (this.prs[k]) prs[k] = this.prs[k];
+    }
+    return { status, prs };
+  }
+
+  // The git popups (one at a time; going between them closes one and opens the other in its
+  // place). `anchor` = where the bar item is: the popup's bottom edge sits just above it (at the
+  // pointer, popups ran off the window's bottom). They're sized to their content.
+  // List: { repos: { root, name, dirs, focus } }. A repo's page: { repo: { dir, info }, back }.
+  openList(ws, anchor) {
     const height = 40 + Math.min(ws.dirs.length, 12) * ROW + 10;
-    const prs = {};
-    for (const d of ws.dirs) { const k = `${d}|${this.repos[d]?.branch}`; if (this.prs[k]) prs[k] = this.prs[k]; }
+    const h = this.handOver(ws.dirs);
     openOverlay({
       mod: "my-status", kind: "popup", width: 640, height,
-      at: { x: Math.max(4, above.x), y: Math.max(4, above.y - height) },
-      props: { repos: { root: ws.root, name: ws.name, dirs: ws.dirs, status: Object.fromEntries(ws.dirs.map((d) => [d, this.repos[d] ?? null])), prs } },
+      at: { x: Math.max(4, anchor.x), y: Math.max(4, anchor.y - height) },
+      props: { repos: { ...ws, status: { ...ws.status, ...h.status }, prs: { ...ws.prs, ...h.prs } }, anchor },
     });
   }
 
-  // Each repo of a dev container's workspace: name, branch (click = switch), ahead/behind,
-  // changes, PR, Sync; Sync all at the top.
+  openPage(dir, back, anchor, cx) {
+    cx.spawn(async () => {
+      const info = await branchInfo(dir);
+      if (!info) return notify({ title: "Not a git repo", body: dir, level: "warning" });
+      const notes = (info.agentsHere > 1 ? 1 : 0) + (info.dirty ? 1 : 0);
+      // title row, notes, up to 10 branches, the "New branch" row, padding
+      const height = 34 + notes * 26 + Math.min(info.branches.length, 10) * 30 + 34 + 16;
+      const st = this.repos?.[dir] ?? this.git?.[dir] ?? null;
+      const pr = st ? this.prs[`${dir}|${st.branch}`] : null;
+      if (props()?.overlay) closeOverlay(props().overlay);
+      openOverlay({
+        mod: "my-status", kind: "popup", width: back ? 640 : 440, height,
+        at: { x: Math.max(4, anchor.x), y: Math.max(4, anchor.y - height) },
+        // what's known of it, under git's own name for the folder
+        props: { repo: { dir: info.root, info, status: st ? { [info.root]: st } : {}, prs: pr ? { [`${info.root}|${st.branch}`]: pr } : {} }, back, anchor },
+      });
+    });
+  }
+
+  // Each repo of a dev container's workspace: name, branch (click = its page: switch, new
+  // branch), ahead/behind, changes, PR, Sync; Sync all at the top. The bar's repo has a dot.
   repoList(t) {
-    const { repos: ws } = props();
+    const { repos: ws, anchor } = props();
     const all = ws.dirs.filter((d) => this.repos[d]);
     const anySyncing = all.some((d) => this.syncing.has(d));
-    const after = (cx) => { this.reread?.(cx); this.readPrs(ws, cx, true); };
-    const icon = (name, spin) => { const s = svg(name).size(12); return spin ? s.spin(900) : s; };
+    const after = (cx) => { this.reread?.(cx); this.readPrs(ws.dirs, cx, true); };
     const row = (dir) => {
       const g = this.repos[dir];
       const name = baseName(dir);
-      const pr = g?.branch ? this.prs[`${dir}|${g.branch}`] : null;
-      const prState = pr?.pr ? (pr.pr.isDraft ? "draft" : pr.pr.state.toLowerCase()) : "";
-      const syncing = this.syncing.has(dir);
+      const here = ws.focus && inside(ws.focus, dir);
       return h_flex().id(`repo-${name}`).h(ROW).flex_none().px(8).gap(12).rounded(7).items_center().hover(s => s.bg(t.hover))
-        .child(div().w(150).flex_none().truncate().text_color(t.foreground).child(name).id(`rn-${name}`).tooltip(dir))
+        .child(h_flex().w(160).flex_none().gap(6).items_center().id(`rn-${name}`).tooltip(here ? `${dir}\n(the focused terminal is here)` : dir)
+          .child(div().size(6).flex_none().rounded(3).when(here, s => s.bg(t.accent)))
+          .child(div().min_w(0).truncate().text_color(t.foreground).child(name)))
         .child(!g ? div().flex_1().text_color(t.dim).child("can't read it from here") : h_flex().id(`rb-${name}`).flex_1().min_w(0).gap(6).items_center()
-          .text_color(t.muted).cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Switch branch")
-          .on_mouse_down("left", (e, cx) => this.openBranches(dir, { x: e.position.x - 16, y: e.position.y - (e.local_position?.y ?? 8) - 8 }, cx))
+          .text_color(t.muted).cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Switch branch, new branch")
+          .on_click((_e, cx) => { const h = this.handOver(ws.dirs); this.openPage(dir, { ...ws, status: { ...ws.status, ...h.status }, prs: { ...ws.prs, ...h.prs } }, anchor, cx); })
           .child(svg("mods/workspace-chrome/branch.svg").size(12).flex_none())
-          .child(div().min_w(0).truncate().child(g.branch ?? "?")))
-        .child(div().w(64).flex_none().text_color(g?.behind ? t.accent : t.muted)
-          .child(g ? [g.ahead > 0 && `↑${g.ahead}`, g.behind > 0 && `↓${g.behind}`].filter(Boolean).join(" ") : ""))
+          .child(div().min_w(0).truncate().child(g.branch ?? "?"))
+          .child(svg("mods/workspace-chrome/chevron-right.svg").size(11).flex_none().text_color(t.dim)))
+        .child(div().w(64).flex_none().text_color(g?.behind ? t.accent : t.muted).child(this.counts(g)))
         .child(div().w(84).flex_none().truncate().text_color(t.muted).child(g?.dirty ? `${g.dirty} change${g.dirty === 1 ? "" : "s"}` : ""))
-        .child(div().w(70).flex_none().child(!pr ? div().text_color(t.dim).child(g?.branch ? "…" : "")
-          : pr.pr ? h_flex().id(`pr-${name}`).gap(5).items_center().cursor_pointer()
-            .text_color(prState === "merged" ? t.ansi5 : prState === "closed" ? t.dim : t.muted).hover(s => s.text_color(t.foreground))
-            .tooltip(`${pr.pr.title} (${prState}) · open`)
-            .on_click((_e, cx) => cx.open_url(pr.pr.url))
-            .child(svg("mods/workspace-chrome/git-compare.svg").size(12)).child(`#${pr.pr.number}`)
-          : div().id(`nopr-${name}`).text_color(t.dim).child(pr.error ? "PR ?" : "no PR").when(Boolean(pr.error), s => s.tooltip(pr.error))))
-        .child(h_flex().id(`sync-${name}`).w(18).flex_none().justify_center().text_color(t.muted)
-          .when(Boolean(g), s => s.cursor_pointer().hover(s => s.text_color(t.foreground))
-            .tooltip(g.upstream ? `Fetch and pull (fast-forward) · ${g.upstream}` : "Fetch · no upstream branch")
-            .on_click((_e, cx) => this.sync([dir], cx, after)))
-          .child(icon("mods/my-status/sync.svg", syncing)));
+        .child(div().w(70).flex_none().child(this.prLink(t, dir, g, false)))
+        .child(this.syncButton(t, dir, g, false, after));
     };
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
       .child(h_flex().h(30).flex_none().px(8).items_center().text_size(11).text_color(t.dim)
@@ -373,53 +420,92 @@ export default class WorkspaceStatus extends View {
         .child(h_flex().id("sync-all").gap(6).items_center().cursor_pointer().text_color(t.muted).hover(s => s.text_color(t.foreground))
           .tooltip("Fetch and pull (fast-forward) every repo")
           .on_click((_e, cx) => this.sync(all, cx, after))
-          .child(icon("mods/my-status/sync.svg", anySyncing)).child(anySyncing ? "syncing…" : "Sync all")))
+          .child(this.syncIcon(anySyncing)).child(anySyncing ? "syncing…" : "Sync all")))
       .child(v_flex().id("repos").flex_none().h(Math.min(ws.dirs.length, 12) * ROW).overflow_y_scrollbar().children(ws.dirs.map(row)));
   }
 
-  // Click the branch: read the repo's local branches (most recent first), uncommitted changes and
-  // which agents work in it, then open the list as a popup of this mod (props {branches}).
-  openBranches(folder, above, cx) {
-    cx.spawn(async () => {
-      const git = (...args) => exec("git", args, { cwd: folder }).catch(() => ({ code: 1, stdout: "", stderr: "" }));
-      const [top, refs, status] = await Promise.all([
-        git("rev-parse", "--show-toplevel"),
-        git("for-each-ref", "--sort=-committerdate", "--format=%(HEAD)|%(refname:short)|%(committerdate:relative)", "refs/heads"),
-        git("-c", "core.filemode=false", "status", "--porcelain"),
-      ]);
-      if (top.code) return notify({ title: "Not a git repo", body: folder, level: "warning" });
-      const root = top.stdout.trim();
-      const norm = (p) => (p ?? "").replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
-      const inRepo = (p) => norm(p) === norm(root) || norm(p).startsWith(norm(root) + "/");
-      const branches = refs.stdout.trim().split("\n").filter(Boolean).map((l) => { const [head, name, when] = l.split("|"); return { name, when, current: head === "*" }; });
-      const agentsHere = panes().filter((p) => p.status && inRepo(p.cwd)).length;
-      const dirty = status.stdout.trim().split("\n").filter(Boolean).length;
-      const notes = (agentsHere > 1 ? 1 : 0) + (dirty ? 1 : 0);
-      // Sized to content (Herdr's popups are): title, one-line notes, up to 10 rows, padding.
-      const height = 30 + notes * 26 + Math.min(branches.length, 10) * 30 + 12;
-      openOverlay({
-        mod: "my-status", kind: "popup", width: 360, height,
-        at: { x: Math.max(4, above.x), y: Math.max(4, above.y - height) },
-        props: { branches, root, agentsHere, dirty },
-      });
+  counts(g) { return g ? [g.ahead > 0 && `↑${g.ahead}`, g.behind > 0 && `↓${g.behind}`].filter(Boolean).join(" ") : ""; }
+  syncIcon(spin) { const s = svg("mods/my-status/sync.svg").size(12); return spin ? s.spin(900) : s; }
+
+  // A repo's PR: "#N" (or "PR #N" with `long`), a dim "…" while looking, "no PR".
+  prLink(t, dir, g, long) {
+    const pr = g?.branch ? this.prs[`${dir}|${g.branch}`] : null;
+    const name = baseName(dir);
+    if (!pr) return div().text_color(t.dim).child(g?.branch ? "…" : "");
+    if (!pr.pr) return div().id(`nopr-${name}`).text_color(t.dim).child(pr.error ? "PR ?" : "no PR").when(Boolean(pr.error), s => s.tooltip(pr.error));
+    const state = pr.pr.isDraft ? "draft" : pr.pr.state.toLowerCase();
+    return h_flex().id(`pr-${name}`).gap(5).items_center().cursor_pointer()
+      .text_color(state === "merged" ? t.ansi5 : state === "closed" ? t.dim : t.muted).hover(s => s.text_color(t.foreground))
+      .tooltip(`${pr.pr.title} (${state}) · open`)
+      .on_click((_e, cx) => cx.open_url(pr.pr.url))
+      .child(svg("mods/workspace-chrome/git-compare.svg").size(12)).child(`${long ? "PR " : ""}#${pr.pr.number}`);
+  }
+
+  // Fetch, then pull --ff-only; with `label`, "Sync" / "syncing…" beside the icon.
+  syncButton(t, dir, g, label, after) {
+    const syncing = this.syncing.has(dir);
+    return h_flex().id(`sync-${baseName(dir)}`).gap(6).flex_none().justify_center().items_center().text_color(t.muted)
+      .when(!label, s => s.w(18))
+      .when(Boolean(g), s => s.cursor_pointer().hover(s => s.text_color(t.foreground))
+        .tooltip(g.upstream
+          ? `Fetch and pull (fast-forward) · ${g.upstream}${g.behind ? ` · ${g.behind} to pull` : ""}${g.ahead ? ` · ${g.ahead} to push` : ""}`
+          : "Fetch · no upstream branch to pull from")
+        .on_click((_e, cx) => this.sync([dir], cx, after)))
+      .child(this.syncIcon(syncing))
+      .when(label, s => s.child(syncing ? "syncing…" : "Sync"));
+  }
+
+  // After a switch or a new branch: back to the list (it reads the new branch), else close.
+  leavePage(cx) {
+    const { back, anchor, overlay } = props();
+    closeOverlay(overlay);
+    if (back) this.openList(back, anchor);
+  }
+
+  // `git switch -c <name>` off the current branch (spaces become "-"); git's refusal shows in the popup.
+  createBranch(cx) {
+    const { repo } = props();
+    const root = repo.dir;
+    const name = this.newBox.value().trim().replace(/\s+/g, "-");
+    if (!name || this.switching) return;
+    this.switching = name; this.error = null; cx.notify();
+    cx.spawn(async (cx) => {
+      const r = await exec("git", ["switch", "-c", name], { cwd: root }).catch((e) => ({ code: 1, stderr: String(e) }));
+      this.switching = null;
+      if (r.code) { this.error = (r.stderr || r.stdout || "git switch -c failed").trim(); cx.notify(); }
+      else { notify({ title: `On new branch ${name}`, body: baseName(root) }); this.leavePage(cx); }
     });
   }
 
-  // The branch list: click one to `git switch` to it; git's refusal shows here instead.
-  branchList(t) {
-    const { branches, root, agentsHere, dirty, overlay } = props();
+  // One repo's page: its upstream, ahead/behind, PR and Sync on top, then its local branches
+  // (click = `git switch`; git's refusal shows here) and "New branch…". From the list, ‹ goes back.
+  repoPage(t) {
+    const { repo, back, anchor, overlay } = props();
+    const { dir, info } = repo;
+    const { branches, agentsHere, dirty } = info;
+    const g = this.repos[dir];
     const note = (text, color) => div().px(8).h(26).flex_none().flex().items_center().text_size(11.2).text_color(color).child(text);
     const pick = (name, cx) => {
       this.switching = name; this.error = null; cx.notify();
       cx.spawn(async (cx) => {
-        const r = await exec("git", ["switch", name], { cwd: root }).catch((e) => ({ code: 1, stderr: String(e) }));
+        const r = await exec("git", ["switch", name], { cwd: dir }).catch((e) => ({ code: 1, stderr: String(e) }));
         this.switching = null;
         if (r.code) { this.error = (r.stderr || r.stdout || "git switch failed").trim(); cx.notify(); }
-        else closeOverlay(overlay);
+        else this.leavePage(cx);
       });
     };
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
-      .child(div().h(20).flex_none().px(8).truncate().text_size(11).text_color(t.dim).child(`Switch branch · ${root.split(/[\\/]/).pop()}`))
+      .child(h_flex().h(30).flex_none().px(8).gap(12).items_center()
+        .when(Boolean(back), el => el.child(h_flex().id("back").gap(4).items_center().cursor_pointer().text_size(11).text_color(t.dim)
+          .hover(s => s.text_color(t.foreground)).tooltip("Back to the repos")
+          .on_click(() => { closeOverlay(overlay); this.openList(back, anchor); })
+          .child(svg("mods/workspace-chrome/chevron-left.svg").size(12)).child("Repos")))
+        .child(h_flex().flex_1().min_w(0).gap(8).items_center()
+          .child(div().flex_none().text_color(t.foreground).child(baseName(dir)))
+          .child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(g?.upstream ?? "")))
+        .child(div().flex_none().text_color(g?.behind ? t.accent : t.muted).child(this.counts(g)))
+        .child(div().flex_none().child(this.prLink(t, dir, g, true)))
+        .child(this.syncButton(t, dir, g, true, (cx) => { this.reread?.(cx); this.readPrs([dir], cx, true); })))
       .when(agentsHere > 1, el => el.child(note(`${agentsHere} agents work in this repo: their files change too`, t.blocked)))
       .when(dirty > 0, el => el.child(note(`${dirty} uncommitted change${dirty === 1 ? "" : "s"} come along (or git refuses)`, t.muted)))
       .when(Boolean(this.error), el => el.child(div().px(8).py(5).text_size(11.2).text_color(t.blocked).child(this.error)))
@@ -429,12 +515,26 @@ export default class WorkspaceStatus extends View {
         .when(!b.current, el => el.cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => pick(b.name, cx)))
         .child(h_flex().w(14).flex_none().justify_center().when(b.current, el => el.child(svg("mods/workspace-chrome/check.svg").size(13).text_color(t.accent))))
         .child(div().flex_1().truncate().child(b.name))
-        .child(div().flex_none().text_size(11).text_color(t.dim).child(this.switching === b.name ? "switching…" : b.when)))));
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(this.switching === b.name ? "switching…" : b.when)))))
+      .child(div().h(1).mt(1).mb(2).flex_none().bg(t.border))
+      .child(this.naming
+        ? h_flex().id("new-branch").h(30).flex_none().px(8).gap(8).items_center()
+          .child(h_flex().w(14).flex_none().justify_center().child(svg("mods/workspace-chrome/plus.svg").size(13).text_color(t.dim)))
+          .child(div().flex_1().min_w(0).h(26).px(6).flex().items_center().rounded(6).bg(t.background).border(1).border_color(t.input)
+            .text_color(t.foreground).child(Input.new(this.newBox)))
+          .when(Boolean(this.switching) && !branches.some((b) => b.name === this.switching),
+            el => el.child(div().flex_none().text_size(11).text_color(t.dim).child("creating…")))
+        : h_flex().id("new-branch").h(30).flex_none().px(8).gap(8).rounded(7).items_center()
+          .text_color(t.muted).cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(`New branch from ${branches.find((b) => b.current)?.name ?? "HEAD"}, switch to it`)
+          .on_click((_e, cx) => { this.naming = true; cx.notify(); cx.timer.after(30, () => this.newBox.focus()); })
+          .child(h_flex().w(14).flex_none().justify_center().child(svg("mods/workspace-chrome/plus.svg").size(13)))
+          .child(div().flex_1().truncate().child("New branch…")));
   }
 
   render() {
     const t = theme();
-    if (props()?.branches) return this.branchList(t);
+    if (props()?.repo) return this.repoPage(t);
     if (props()?.repos) return this.repoList(t);
     const space = spaces().find(s => s.active);
     const list = agents();
@@ -451,40 +551,35 @@ export default class WorkspaceStatus extends View {
     const g = folder ? this.git[folder] : null;
     // git's own answer first; Herdr's until it has been read (or on another machine).
     const branch = g?.branch || (f?.pane && panes().find(p => p.pane === f.pane)?.branch) || space?.branch;
-    const syncing = this.syncing.has(folder);
-    const counts = g ? [g.ahead > 0 && `↑${g.ahead}`, g.behind > 0 && `↓${g.behind}`].filter(Boolean).join(" ") : "";
-    const syncIcon = svg("mods/my-status/sync.svg").size(12);
     this.key = folder && branch ? `${folder}|${branch}` : null;
     const pr = this.key ? this.prs[this.key]?.pr : null;
     const prState = pr ? (pr.isDraft ? "draft" : pr.state.toLowerCase()) : "";
-    // A dev container's workspace: its repos' totals on the bar, the list in a popup.
+    // A dev container's workspace: all its repos in the popup.
     const ws = space && !space.machine ? this.workspace(f, space, folder) : null;
     const wsKey = ws ? `${ws.root}|${ws.dirs.join("|")}` : "";
     if (wsKey !== this.wsKey) { this.wsKey = wsKey; this.ws = ws; } // readRepos reads this.ws
     const known = ws ? ws.dirs.map((d) => [d, this.repos[d]]).filter(([, r]) => r) : [];
-    const behind = known.reduce((s, [, r]) => s + r.behind, 0);
-    const changed = known.filter(([, r]) => r.dirty).length;
+    const othersBehind = known.filter(([d]) => !inside(folder, d)).reduce((s, [, r]) => s + r.behind, 0);
+    // One git item: the bar's branch and how far ahead/behind, and in a dev container "· N repos".
+    // Click = the repos list (dev container) or this repo's page (Sync, switch, new branch).
+    const counts = this.counts(g);
+    const text = [branch && `${branch}${counts ? ` ${counts}` : ""}`, ws && `${ws.dirs.length} repos`].filter(Boolean).join(" · ");
+    const tip = ws
+      ? [`Repos in ${ws.root} (dev container)`, ...known.map(([d, r]) =>
+        `${inside(folder, d) ? "• " : ""}${baseName(d)}: ${r.branch}${r.ahead ? ` ↑${r.ahead}` : ""}${r.behind ? ` ↓${r.behind}` : ""}${r.dirty ? ` · ${r.dirty} changed` : ""}`),
+        "Click: sync, switch branch"].join("\n")
+      : [g?.upstream ? `${g.upstream}${g.behind ? ` · ${g.behind} to pull` : ""}${g.ahead ? ` · ${g.ahead} to push` : ""}` : null,
+        g?.dirty ? `${g.dirty} uncommitted change${g.dirty === 1 ? "" : "s"}` : null, "Click: sync, switch branch, new branch"].filter(Boolean).join("\n");
     return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
-      .when(Boolean(ws), el => el.child(label("layers", `${ws.dirs.length} repos${behind ? ` ↓${behind}` : ""}`).id("repos")
-        .when(behind > 0, s => s.text_color(t.accent))
-        .cursor_pointer().hover(s => s.text_color(t.foreground))
-        .tooltip([`Repos in ${ws.root} (dev container)`, ...known.map(([d, r]) =>
-          `${baseName(d)}: ${r.branch}${r.ahead ? ` ↑${r.ahead}` : ""}${r.behind ? ` ↓${r.behind}` : ""}${r.dirty ? ` · ${r.dirty} changed` : ""}`),
-          changed ? `${changed} with uncommitted changes` : null].filter(Boolean).join("\n"))
-        .on_mouse_down("left", (e) => this.openRepos(ws, { x: e.position.x - 16, y: e.position.y - (e.local_position?.y ?? 8) - 8 }))))
-      .when(Boolean(branch), el => el.child(label("branch", branch).id("branch")
-        .when(Boolean(folder), s => s.cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Switch branch")
-          // mouse down, not click: it carries where (the popup goes above the bar; at the pointer
-          // it ran off the window's bottom)
-          .on_mouse_down("left", (e, cx) => this.openBranches(folder, { x: e.position.x - 16, y: e.position.y - (e.local_position?.y ?? 8) - 8 }, cx)))))
-      .when(Boolean(g?.branch), el => el.child(h_flex().id("sync").gap(6).items_center().cursor_pointer()
-        .text_color(g.behind > 0 && !syncing ? t.accent : t.muted).hover(s => s.text_color(t.foreground))
-        .tooltip(g.upstream
-          ? `Fetch and pull (fast-forward) · ${g.upstream}${g.behind ? ` · ${g.behind} to pull` : ""}${g.ahead ? ` · ${g.ahead} to push` : ""}`
-          : "Fetch · no upstream branch to pull from")
-        .on_click((_e, cx) => this.sync([folder], cx, (cx) => this.readGit(cx)))
-        .child(syncing ? syncIcon.spin(900) : syncIcon)
-        .child(syncing ? "syncing…" : counts || "Sync")))
+      .when(Boolean(text), el => el.child(label(branch ? "branch" : "layers", text).id("git")
+        .when((g?.behind ?? 0) + othersBehind > 0, s => s.text_color(t.accent))
+        .when(Boolean(folder) && (Boolean(ws) || Boolean(g)), s => s.cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip(tip)
+          // mouse down, not click: it carries where (the popup goes above the bar)
+          .on_mouse_down("left", (e, cx) => {
+            const anchor = { x: e.position.x - 16, y: e.position.y - (e.local_position?.y ?? 8) - 8 };
+            if (ws) this.openList({ root: ws.root, name: ws.name, dirs: ws.dirs, focus: folder }, anchor);
+            else this.openPage(folder, null, anchor, cx);
+          }))))
       .when(Boolean(folder), el => el.child(button("open-folder", "folder", "Folder", "folder")).child(button("open-code", "file-text", "VS Code", "code")))
       .when(Boolean(pr), el => el.child(label("git-compare", `PR #${pr.number}`).id("open-pr").cursor_pointer()
         .when(prState === "merged", s => s.text_color(t.ansi5)).when(prState === "closed", s => s.text_color(t.dim))
