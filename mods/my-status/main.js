@@ -45,7 +45,7 @@ const baseName = (p) => resolvePath(p).split(/[\\/]/).pop();
 
 // One repo's branch, upstream, ahead/behind and changed files, from one `git status` (the call
 // Herdr's `spaces` list makes). core.filemode off: a repo cloned in a Linux container has it on,
-// and from Windows every file then looks changed (684 in rulebook-knowledge, 2026-11-03).
+// and from Windows every file then looks changed (684 files in one repo, 2026-11-03).
 async function gitStatus(folder) {
   try {
     const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.filemode=false",
@@ -106,7 +106,7 @@ async function forgeOf(folder) {
 // it ({ url, number, state: OPEN|MERGED|CLOSED, isDraft, title, head }) or null. GitHub: `gh pr
 // view` (needs gh signed in). Azure DevOps: one PowerShell call for all of them (~2 s).
 // A merged or closed PR counts only while the branch is still at its last commit: a long-lived
-// branch (main, AI-main) otherwise shows some old PR that once came from it.
+// branch (main, a shared lane) otherwise shows some old PR that once came from it.
 async function prsFor(list) {
   const out = {};
   const azure = [];
