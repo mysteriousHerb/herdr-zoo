@@ -2,7 +2,7 @@ import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import os from "os";
 import { readdir, exists } from "fs/promises";
-import { spaces, agents, panes, focused, theme, run, window, shared, exec, notify, openOverlay, closeOverlay, props, appHome } from "herdr";
+import { spaces, agents, panes, focused, theme, run, window, shared, setShared, exec, notify, openOverlay, closeOverlay, props, appHome } from "herdr";
 
 // Clone of Herdr's workspace-status (0.1.10); changes: no agents count (the zoo shows them), and
 // how many sub-agents are at work, from claude-chat's shared "chat.subs" ({ "<address>": n }). Click = the agent with the most.
@@ -19,6 +19,9 @@ import { spaces, agents, panes, focused, theme, run, window, shared, exec, notif
 const WIN = /^win/.test(os.platform()); // "windows" here, not node's "win32"
 // claude-chat shares which container each Claude runs in: { "<address>": "<container id or name>" }.
 const CONTAINERS = "chat.containers";
+// The repo each dev container workspace shows on the bar, picked in the repos list:
+// { "<workspace root, lowercase>": "<repo folder>" }. Unset = the focused terminal's repo.
+const SHOWN = "status.shownRepo";
 
 function openFolder(folder, what) {
   const [cmd, args] = what === "code"
@@ -208,7 +211,7 @@ export default class WorkspaceStatus extends View {
       this.readGit(cx);
       this.lookup(cx);
       if (ticks % 10 === 0) this.readBoxes(cx);
-      if (ticks % 3 === 0) this.readRepos(cx);
+      if (ticks % 3 === 0 || this.wsKey !== this.readKey) this.readRepos(cx); // at once on a new workspace
     });
   }
 
@@ -243,6 +246,7 @@ export default class WorkspaceStatus extends View {
   readRepos(cx) {
     const ws = this.ws;
     if (!ws || this.readingRepos) return;
+    this.readKey = this.wsKey;
     this.readingRepos = true;
     cx.spawn(async (cx) => {
       const got = await Promise.all(ws.dirs.map(gitStatus));
@@ -398,12 +402,14 @@ export default class WorkspaceStatus extends View {
     const row = (dir) => {
       const g = this.repos[dir];
       const name = baseName(dir);
-      const here = ws.focus && inside(ws.focus, dir);
+      const here = pathKey(dir) === pathKey(ws.shown ?? "");
       return h_flex().id(`repo-${name}`).h(ROW).flex_none().px(8).gap(12).rounded(7).items_center().hover(s => s.bg(t.hover))
-        .child(h_flex().w(160).flex_none().gap(6).items_center().id(`rn-${name}`).tooltip(here ? `${dir}\n(the focused terminal is here)` : dir)
+        .child(h_flex().w(160).flex_none().gap(6).items_center().id(`rn-${name}`).cursor_pointer()
+          .tooltip(`${dir}\n${here ? "On the status bar" : "Click: show it on the status bar"}`)
+          .on_click(() => { setShared(SHOWN, { ...(shared(SHOWN) ?? {}), [pathKey(ws.root)]: dir }); closeOverlay(props().overlay); })
           .child(div().size(6).flex_none().rounded(3).when(here, s => s.bg(t.accent)))
           .child(div().min_w(0).truncate().text_color(t.foreground).child(name)))
-        .child(!g ? div().flex_1().text_color(t.dim).child("can't read it from here") : h_flex().id(`rb-${name}`).flex_1().min_w(0).gap(6).items_center()
+        .child(!g ? div().flex_1().text_color(t.dim).child(g === null ? "can't read it from here" : "…") : h_flex().id(`rb-${name}`).flex_1().min_w(0).gap(6).items_center()
           .text_color(t.muted).cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Switch branch, new branch")
           .on_click((_e, cx) => { const h = this.handOver(ws.dirs); this.openPage(dir, { ...ws, status: { ...ws.status, ...h.status }, prs: { ...ws.prs, ...h.prs } }, anchor, cx); })
           .child(svg("mods/workspace-chrome/branch.svg").size(12).flex_none())
@@ -547,27 +553,31 @@ export default class WorkspaceStatus extends View {
       .tooltip(`${what === "code" ? "Open in VS Code" : "Open in Explorer"}: ${folder}`)
       .on_click(() => openFolder(folder, what));
     const f = focused();
-    this.folder = folder; // what readGit reads on its next tick
-    const g = folder ? this.git[folder] : null;
-    // git's own answer first; Herdr's until it has been read (or on another machine).
-    const branch = g?.branch || (f?.pane && panes().find(p => p.pane === f.pane)?.branch) || space?.branch;
-    this.key = folder && branch ? `${folder}|${branch}` : null;
-    const pr = this.key ? this.prs[this.key]?.pr : null;
-    const prState = pr ? (pr.isDraft ? "draft" : pr.state.toLowerCase()) : "";
-    // A dev container's workspace: all its repos in the popup.
+    // A dev container's workspace: all its repos in the popup, and on the bar the one picked
+    // there (else the focused terminal's), by name.
     const ws = space && !space.machine ? this.workspace(f, space, folder) : null;
     const wsKey = ws ? `${ws.root}|${ws.dirs.join("|")}` : "";
     if (wsKey !== this.wsKey) { this.wsKey = wsKey; this.ws = ws; } // readRepos reads this.ws
+    const picked = ws ? (shared(SHOWN) ?? {})[pathKey(ws.root)] : null;
+    const shown = ws ? (ws.dirs.find((d) => picked && pathKey(d) === pathKey(picked)) ?? ws.dirs.find((d) => inside(folder, d)) ?? null) : null;
+    const gitDir = shown ?? folder;
+    this.folder = gitDir; // what readGit reads on its next tick
+    const g = gitDir ? this.git[gitDir] : null;
+    // git's own answer first; Herdr's until it has been read (or on another machine).
+    const branch = g?.branch || (gitDir === folder ? (f?.pane && panes().find(p => p.pane === f.pane)?.branch) || space?.branch : null);
+    this.key = gitDir && branch ? `${gitDir}|${branch}` : null;
+    const pr = this.key ? this.prs[this.key]?.pr : null;
+    const prState = pr ? (pr.isDraft ? "draft" : pr.state.toLowerCase()) : "";
     const known = ws ? ws.dirs.map((d) => [d, this.repos[d]]).filter(([, r]) => r) : [];
-    const othersBehind = known.filter(([d]) => !inside(folder, d)).reduce((s, [, r]) => s + r.behind, 0);
-    // One git item: the bar's branch and how far ahead/behind, and in a dev container "· N repos".
-    // Click = the repos list (dev container) or this repo's page (Sync, switch, new branch).
+    const othersBehind = known.filter(([d]) => d !== shown).reduce((s, [, r]) => s + r.behind, 0);
+    // One git item: the bar's repo (in a dev container, by name), its branch and how far
+    // ahead/behind, and "· N repos". Click = the repos list (dev container) or this repo's page.
     const counts = this.counts(g);
-    const text = [branch && `${branch}${counts ? ` ${counts}` : ""}`, ws && `${ws.dirs.length} repos`].filter(Boolean).join(" · ");
+    const text = [branch && `${shown ? `${baseName(shown)}: ` : ""}${branch}${counts ? ` ${counts}` : ""}`, ws && `${ws.dirs.length} repos`].filter(Boolean).join(" · ");
     const tip = ws
       ? [`Repos in ${ws.root} (dev container)`, ...known.map(([d, r]) =>
-        `${inside(folder, d) ? "• " : ""}${baseName(d)}: ${r.branch}${r.ahead ? ` ↑${r.ahead}` : ""}${r.behind ? ` ↓${r.behind}` : ""}${r.dirty ? ` · ${r.dirty} changed` : ""}`),
-        "Click: sync, switch branch"].join("\n")
+        `${d === shown ? "• " : ""}${baseName(d)}: ${r.branch}${r.ahead ? ` ↑${r.ahead}` : ""}${r.behind ? ` ↓${r.behind}` : ""}${r.dirty ? ` · ${r.dirty} changed` : ""}`),
+        "Click: pick the repo shown here, sync, switch branch"].join("\n")
       : [g?.upstream ? `${g.upstream}${g.behind ? ` · ${g.behind} to pull` : ""}${g.ahead ? ` · ${g.ahead} to push` : ""}` : null,
         g?.dirty ? `${g.dirty} uncommitted change${g.dirty === 1 ? "" : "s"}` : null, "Click: sync, switch branch, new branch"].filter(Boolean).join("\n");
     return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
@@ -577,7 +587,7 @@ export default class WorkspaceStatus extends View {
           // mouse down, not click: it carries where (the popup goes above the bar)
           .on_mouse_down("left", (e, cx) => {
             const anchor = { x: e.position.x - 16, y: e.position.y - (e.local_position?.y ?? 8) - 8 };
-            if (ws) this.openList({ root: ws.root, name: ws.name, dirs: ws.dirs, focus: folder }, anchor);
+            if (ws) this.openList({ root: ws.root, name: ws.name, dirs: ws.dirs, shown }, anchor);
             else this.openPage(folder, null, anchor, cx);
           }))))
       .when(Boolean(folder), el => el.child(button("open-folder", "folder", "Folder", "folder")).child(button("open-code", "file-text", "VS Code", "code")))
