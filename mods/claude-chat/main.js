@@ -148,6 +148,7 @@ const sameSlash = (a, b) => Boolean(a && b) && a.start === b.start && a.q === b.
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 // Shared: how many sub-agents each Claude agent has at work, { "<address>": n }, for my-status.
 const SUBS = "chat.subs";
+const CONTAINERS = "chat.containers"; // { "<address>": "<container>" }, for my-status
 // A sub-agent still at work: its meta doesn't say finished, and a foreground one's call isn't
 // answered yet (an interrupted one's meta may never say finished).
 const subRunning = (sub, tool) => !sub.finished && (tool?.result === undefined || /^Async agent launched/.test(tool.result));
@@ -575,6 +576,12 @@ export default class ClaudeChat extends View {
     count(this.address, this.subs, this.tools);
     const key = (o) => JSON.stringify(Object.entries(o ?? {}).sort());
     if (key(counts) !== key(shared(SUBS))) setShared(SUBS, counts);
+    // Which dev container each Claude runs in (its id or name, as `docker exec` got it), for
+    // my-status: the container's /workspace holds the repos that agent works on.
+    const boxes = {};
+    for (const [address, kept] of this.cache) if (address !== this.address && kept.where?.container) boxes[address] = kept.where.container;
+    if (this.address && this.where?.container) boxes[this.address] = this.where.container;
+    if (key(boxes) !== key(shared(CONTAINERS))) setShared(CONTAINERS, boxes);
   }
 
   // props.terminal, else the shown tab's Claude (the focused one when it has several).
