@@ -3,7 +3,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, knownAgents } from "herdr";
 import PACKS from "./sprites.js";
 import { startJobs } from "./jobs.js";
 
@@ -35,11 +35,17 @@ function lead(tab, all = panes()) {
   return mine.find(p => p.program?.agent) ?? mine.find(p => p.focused) ?? mine[0];
 }
 
+// A tab named after its program (the pane's, or a + menu entry's, `LAUNCHERS`: a "Claude (dev
+// container)" tab's pane reports "Claude Code") shows the agent's title. Copied in my-tabs.
+const LAUNCHERS = new Set();
+function loadLaunchers(cx) {
+  cx.spawn(async () => { for (const k of await knownAgents()) LAUNCHERS.add(k.name); });
+}
 function title(tab, l) {
   const prog = l?.program?.name;
   const live = clean(l?.title);
   const telling = live && live !== prog && !/^[~/]|^[A-Za-z]:\\/.test(live) && !live.includes("@") && live.toLowerCase() !== l?.program?.key;
-  return tab.name === prog && telling ? live : tab.name;
+  return (tab.name === prog || LAUNCHERS.has(tab.name)) && telling ? live : tab.name;
 }
 // Unread vs done. Herdr's "done" = finished while you weren't looking, and it turns "idle" once
 // you look, so a finished agent you've read looked like one that never did anything. Worse, Herdr
@@ -150,6 +156,7 @@ function viewSwitch(t, here) {
 export default class Agents extends View {
   init(_props, cx) {
     if (props()?.sortMenu) return;
+    loadLaunchers(cx);
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
     this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");

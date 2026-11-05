@@ -1,11 +1,11 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import os from "os";
-import { readdir, exists } from "fs/promises";
-import { spaces, agents, panes, focused, theme, run, window, shared, setShared, exec, notify, openOverlay, closeOverlay, props, appHome } from "herdr";
+import { readdir, exists, readFile, mkdir } from "fs/promises";
+import { spaces, agents, panes, focused, theme, run, window, shared, setShared, exec, notify, openOverlay, closeOverlay, props, appHome, watchFolder } from "herdr";
 
-// Clone of Herdr's workspace-status (0.1.10); changes: no agents count (the zoo shows them), and
-// how many sub-agents are at work, from claude-chat's shared "chat.subs" ({ "<address>": n }). Click = the agent with the most.
+// Clone of Herdr's workspace-status (0.1.10); changes: no agents count (the zoo shows them; the
+// "N sub-agents working" item went too, 2026-11-05: the zoo pens and the chat's chips show them).
 // Also: "Folder" and "VS Code" open the focused terminal's folder (else the space's), on this
 // computer only; same as the zoo's agent menu (`open` there, duplicated: mods can't share code).
 // The branch name opens a list of the repo's branches to `git switch` to; "PR #N" opens its PR.
@@ -188,6 +188,61 @@ async function branchInfo(folder) {
 
 const ROW = 34; // a repo row's height in the repos popup
 
+// Plan usage (the 5-hour and weekly limits, as /usage shows them). Claude Code hands them to its
+// status line command, and statusline.cjs (set up in ~/.claude/settings.json) saves them here,
+// so they're as fresh as the last running Claude's status line.
+const USAGE_DIR = () => `${appHome()}/data/my-status`;
+const USAGE_POPUP_W = 320;
+
+// { at, rate_limits: { five_hour: { used_percentage, resets_at (Unix s) }, seven_day: … } } | null
+async function readUsageFile() {
+  try { return JSON.parse(await readFile(`${USAGE_DIR()}/usage.json`, "utf8")); } catch { return null; }
+}
+
+function limitName(key) {
+  if (key === "five_hour") return "5-hour limit";
+  if (key === "seven_day") return "Weekly limit";
+  if (key === "spend_limit") return "Spend limit";
+  const m = /^seven_day_(.+)$/.exec(key);
+  if (m) return `Weekly limit · ${m[1].replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase())}`;
+  return key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+// Each window: { key, name, short, pct, resets (ms) | null, reset (true once resets has passed:
+// the saved % is then the old window's, so it shows 0), spend ("$x / $y …") }.
+function usageWindows(usage) {
+  return Object.entries(usage?.rate_limits ?? {})
+    .filter(([, w]) => w && typeof w.used_percentage === "number")
+    .map(([key, w]) => {
+      const r = w.resets_at;
+      const resets = typeof r === "number" ? (r < 1e12 ? r * 1000 : r) : typeof r === "string" ? Date.parse(r) || null : null;
+      const reset = Boolean(resets && resets <= Date.now());
+      const short = key === "five_hour" ? "5h" : key === "seven_day" ? "wk" : null;
+      const spend = typeof w.used_usd === "number" && typeof w.limit_usd === "number"
+        ? `$${w.used_usd.toFixed(2)} / $${w.limit_usd.toFixed(2)}${w.period ? ` this ${w.period}` : ""}` : null;
+      return { key, name: limitName(key), short, pct: reset ? 0 : Math.max(0, Math.min(100, Math.round(w.used_percentage))), resets, reset, spend };
+    })
+    .sort((a, b) => (a.key === "five_hour" ? -1 : b.key === "five_hour" ? 1 : a.key.localeCompare(b.key)));
+}
+
+// "3:10 PM", with the weekday when it isn't today ("Mon 9:00 AM").
+function clock(ms) {
+  const d = new Date(ms), now = new Date();
+  const h = d.getHours(), m = String(d.getMinutes()).padStart(2, "0");
+  const time = `${h % 12 || 12}:${m} ${h < 12 ? "AM" : "PM"}`;
+  return d.toDateString() === now.toDateString() ? time : `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} ${time}`;
+}
+
+function ago(ms) {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+
+const resetText = (w) => (w.reset ? `Reset at ${clock(w.resets)}` : w.resets ? `Resets at ${clock(w.resets)}` : "");
+
 export default class WorkspaceStatus extends View {
   init(_props, cx) {
     this.prs = {}; // "<folder>|<branch>" → { pr, error?, at }
@@ -200,6 +255,8 @@ export default class WorkspaceStatus extends View {
       return this.initRepos({ dirs: [p.repo.dir], status: p.repo.status, prs: p.repo.prs }, cx);
     }
     if (p.repos) return this.initRepos(p.repos, cx);
+    if (p.usage) return this.initUsage(cx, false);
+    this.initUsage(cx, true);
     this.git = {}; // folder -> { branch, upstream, ahead, behind, dirty } | null (not a repo)
     this.boxes = []; // devContainers()
     this.dirs = {}; // workspace root → its repos
@@ -213,6 +270,63 @@ export default class WorkspaceStatus extends View {
       if (ticks % 10 === 0) this.readBoxes(cx);
       if (ticks % 3 === 0 || this.wsKey !== this.readKey) this.readRepos(cx); // at once on a new workspace
     });
+  }
+
+  // Plan usage from statusline.cjs's file. The bar watches the folder and redraws only when a
+  // number changes (or a window resets: it then shows 0 with no new payload); the popup rereads
+  // every 5 s so its "updated … ago" moves on.
+  initUsage(cx, watch) {
+    this.usage = null;
+    this.usageSig = "";
+    const check = (cx) => {
+      const s = JSON.stringify(usageWindows(this.usage).map((w) => [w.key, w.pct, w.reset, w.resets, w.spend]));
+      if (s !== this.usageSig) { this.usageSig = s; cx.notify(); }
+    };
+    const read = (cx) => cx.spawn(async (cx) => { this.usage = await readUsageFile(); check(cx); });
+    read(cx);
+    if (watch) {
+      cx.spawn(async (cx) => {
+        await mkdir(USAGE_DIR(), { recursive: true }).catch(() => {});
+        for (;;) {
+          try { await watchFolder(USAGE_DIR()); } catch { await cx.sleep(60000); }
+          read(cx);
+        }
+      });
+      cx.timer.every(30000, check);
+    } else cx.timer.every(5000, (cx) => { read(cx); cx.notify(); });
+  }
+
+  openUsage(anchor) {
+    const n = Math.max(1, usageWindows(this.usage).length);
+    const height = 34 + n * 58 + 30 + 10;
+    openOverlay({
+      mod: "my-status", kind: "popup", width: USAGE_POPUP_W, height,
+      at: { x: Math.max(4, anchor.x - USAGE_POPUP_W + 60), y: Math.max(4, anchor.y - height) },
+      props: { usage: true },
+    });
+  }
+
+  // Each limit: name, % used, a bar, when it resets; then how fresh the numbers are.
+  usagePopup(t) {
+    const uw = usageWindows(this.usage);
+    const W = USAGE_POPUP_W - 10 - 16; // the bar's width: the popup less its padding
+    const tone = (pct) => (pct >= 90 ? t.blocked : t.accent);
+    return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
+      .child(h_flex().h(30).flex_none().px(8).items_center().text_size(11).text_color(t.dim)
+        .child(div().flex_1().child("Plan usage"))
+        .child(div().id("usage-page").cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Open claude.ai's usage page")
+          .on_click((_e, cx) => cx.open_url("https://claude.ai/settings/usage")).child("claude.ai ›")))
+      .when(!uw.length, el => el.child(div().h(58).px(8).flex().items_center().text_color(t.muted)
+        .child("No usage yet: it comes from a running Claude's status line.")))
+      .children(uw.map((w) => v_flex().h(58).flex_none().px(8).py(6).gap(6)
+        .child(h_flex().items_center()
+          .child(div().flex_1().truncate().text_color(t.foreground).child(w.name))
+          .child(div().flex_none().text_color(w.pct >= 90 ? t.blocked : t.muted).child(`${w.pct}% used`)))
+        .child(div().h(6).w(W).flex_none().rounded(3).bg(t.hover)
+          .child(div().h(6).w(Math.round((W * w.pct) / 100)).rounded(3).bg(tone(w.pct))))
+        .child(div().text_size(11).text_color(t.dim).child([resetText(w), w.spend].filter(Boolean).join(" · ")))))
+      .child(div().h(30).flex_none().px(8).flex().items_center().text_size(11).text_color(t.dim)
+        .child(this.usage?.at ? `Updated ${ago(this.usage.at)}, from Claude's status line` : ""));
   }
 
   // The bar's folder, read with git. Only redraws when something changed.
@@ -542,11 +656,14 @@ export default class WorkspaceStatus extends View {
     const t = theme();
     if (props()?.repo) return this.repoPage(t);
     if (props()?.repos) return this.repoList(t);
+    if (props()?.usage) return this.usagePopup(t);
+    // Plan usage: "5h 17% · wk 37%" (click = the popup); amber from 90%.
+    const uw = usageWindows(this.usage);
+    const usageText = uw.some((w) => w.short) ? uw.filter((w) => w.short).map((w) => `${w.short} ${w.pct}%`).join(" · ") : uw.length ? `${uw[0].pct}%` : "";
+    const usageTip = [...uw.map((w) => `${w.name}: ${w.pct}% used${w.resets ? ` · ${resetText(w).toLowerCase()}` : ""}`),
+      this.usage?.at ? `Updated ${ago(this.usage.at)}` : null, "Click: details"].filter(Boolean).join("\n");
     const space = spaces().find(s => s.active);
     const list = agents();
-    const subs = Object.entries(shared("chat.subs") ?? {}).filter(([address]) => list.some(a => a.address === address)).sort((a, b) => b[1] - a[1]);
-    const working = subs.reduce((sum, [, n]) => sum + n, 0);
-    const title = (address) => list.find(a => a.address === address)?.title || address;
     const label = (icon, text) => h_flex().gap(6).items_center().child(svg(`mods/workspace-chrome/${icon}.svg`).size(13)).child(text);
     const folder = space && !space.machine ? (focused()?.cwd || space.folder) : "";
     const button = (id, icon, text, what) => label(icon, text).id(id).cursor_pointer().hover(s => s.text_color(t.foreground))
@@ -596,13 +713,11 @@ export default class WorkspaceStatus extends View {
         .hover(s => s.text_color(t.foreground))
         .tooltip(`${pr.title} (${prState}) · open`)
         .on_click((_e, cx) => cx.open_url(pr.url))))
-      .when(working > 0, el => el.child(h_flex().id("subs").gap(6).items_center().cursor_pointer().text_color(t.working)
-        .hover(s => s.text_color(t.foreground))
-        .tooltip(subs.map(([address, n]) => `${title(address)}: ${n}`).join("\n"))
-        .on_click(() => run("pane.focus", { terminal: subs[0][0] }))
-        .child(svg("mods/workspace-chrome/spinner.svg").size(11).spin(900))
-        .child(working === 1 ? "1 sub-agent working" : `${working} sub-agents working`)))
       .child(div().flex_1())
+      .when(Boolean(usageText), el => el.child(label("clock", usageText).id("usage").cursor_pointer()
+        .when(uw.some((w) => w.pct >= 90), s => s.text_color(t.blocked))
+        .hover(s => s.text_color(t.foreground)).tooltip(usageTip)
+        .on_mouse_down("left", (e) => this.openUsage({ x: e.position.x, y: e.position.y - (e.local_position?.y ?? 8) - 8 }))))
       .child(div().id("palette").text_color(t.dim).on_click(() => run("app.palette")).child(`${window()?.platform === "macos" ? "⌘" : "Ctrl"} Shift P  commands`))
       // The machine, last: rarely looked at (the user's call 2026-11-01).
       .child(label(space?.machine ? "server" : "monitor", space?.machine ?? "This computer"));
