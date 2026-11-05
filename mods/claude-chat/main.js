@@ -619,10 +619,10 @@ export default class ClaudeChat extends View {
     return (node?.active ?? node?.children?.[0]?.id) === self;
   }
 
-  // A tab first seen with no Claude in it (and none starting) flips the stack to Terminal,
-  // once per tab. The stack is shared by every tab, so it flips back to the chat as soon as a
-  // Claude runs there (or on going to a tab with one): the first message can be typed in the
-  // chat, it goes by `hc send` like any other. Only a flip made here goes back: Terminal
+  // A tab with no Claude in it (and none starting) always shows the Terminal: the chat has
+  // nothing to show there. The stack is shared by every tab, so it flips back to the chat as
+  // soon as a Claude runs there (or on going to a tab with one): the first message can be typed
+  // in the chat, it goes by `hc send` like any other. Only a flip made here goes back: Terminal
   // picked by hand stays.
   autoView(agent) {
     const { stack, self, other } = props() ?? {};
@@ -631,10 +631,9 @@ export default class ClaudeChat extends View {
     const empty = !agent && !starting(tab);
     const showing = this.showing();
     if (showing) this.flipped = false;
-    this.seenTabs ??= new Set();
-    if (!this.seenTabs.has(tab)) {
-      this.seenTabs.add(tab);
-      if (empty && showing) { this.flipped = true; run("layout.select", { stack, child: other }); }
+    if (empty && showing) {
+      this.flipped = true;
+      run("layout.select", { stack, child: other });
     } else if (this.flipped && !empty) {
       this.flipped = false;
       run("layout.select", { stack, child: self });
@@ -1725,6 +1724,8 @@ export default class ClaudeChat extends View {
     // The chosen font goes to the messages and the box, not the header.
     const font = (el) => el.when(look.font === "mono", (el) => el.font_family(this.mono()));
     if (!agent) {
+      // A tab with no Claude goes to the Terminal now rather than on the next 2 s tick.
+      if (props()?.stack) cx.timer.after(0, () => this.autoView(null));
       const text = starting(focused()?.tab) ? "Starting Claude…" : "No Claude agent in this tab.";
       return root.items_center().justify_center().gap(10).text_color(t.dim).child(text)
         .when(Boolean(props()?.stack), (el) => el.child(this.button(t, "show-terminal", "Show terminal", () => this.toTerminal())));
