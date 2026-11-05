@@ -5,7 +5,7 @@
 // Claude agent). A dev container's Claude (docker exec ... claude) is read through docker.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView, TextareaState, Textarea, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, TextView, TextareaState, Textarea, InputState, Input, Popover } from "gpui-base";
 import { readFile, readdir, exists, writeFile } from "fs/promises";
 import os from "os";
 import { Buffer } from "buffer";
@@ -118,6 +118,17 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
   "hooks", "ide", "keybindings", "list-agents", "login", "logout", "mcp", "memory", "mobile", "model", "output-style",
   "permissions", "plugin", "powerup", "radio", "rate-limit-options", "release-notes", "remote-control", "resume",
   "rewind", "skills", "status", "statusline", "tasks", "theme", "tui", "usage", "workflows"]);
+
+// The header's model / effort bar (see pick), as Claude's /model list names them; the alias is
+// how settings.json's "model" names the default. Read off Claude 2.1.318, 2026-11-05.
+const MODELS = [["opus", "Opus 5.5"], ["fable", "Fable 5.1"], ["sonnet", "Sonnet 5.5"], ["haiku", "Haiku 5.5"]];
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+// "claude-opus-5-5" → "Opus 5.5"; a display name stays as it is.
+const modelLabel = (m) => {
+  const id = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{6,})?$/.exec(m ?? "");
+  return id ? `${id[1][0].toUpperCase()}${id[1].slice(1)} ${id[2]}${id[3] ? `.${id[3]}` : ""}` : m || null;
+};
+const modelId = (label) => label ? `claude-${label.toLowerCase().replace(/[ .]/g, "-")}` : null;
 
 // The box can't say where its caret is, so it's taken from the edit: the end of what changed
 // between the two values (where typing or a paste left it).
@@ -519,7 +530,8 @@ export default class ClaudeChat extends View {
   // Each agent's chat is kept, so going back to one shows it at once; the tick then catches up.
   reset(address) {
     if (this.address) this.cache.set(this.address, { where: this.where, session: this.session, file: this.file,
-      pos: this.pos, items: this.items, tools: this.tools, skills: this.skills, subs: this.subs, looked: this.looked, lastReply: this.lastReply });
+      pos: this.pos, items: this.items, tools: this.tools, skills: this.skills, subs: this.subs, looked: this.looked, lastReply: this.lastReply,
+      model: this.model, effort: this.effort });
     this.address = address;
     const kept = this.cache.get(address) ?? {};
     this.where = kept.where ?? null; this.session = kept.session ?? null; this.file = kept.file ?? null; this.pos = kept.pos ?? 0;
@@ -527,6 +539,10 @@ export default class ClaudeChat extends View {
     // subs: each sub-agent by the id of the tool call that started it; trail: the ones opened.
     this.subs = kept.subs ?? new Map(); this.trail = [];
     this.looked = kept.looked ?? 0; this.stale = Boolean(kept.file); this.lastReply = kept.lastReply ?? null;
+    // The model as the transcript last named it (a reply's, or /model's output), and the effort
+    // /effort last set: { level, model } (the model it was set on).
+    this.model = kept.model ?? null; this.effort = kept.effort ?? null;
+    this.drop = null; this.pickNote = null;
     this.limit = PAGE; this.problem = null; this.screen = null; this.up = 0;
     this.rowH = new Map(); this.seek = null;
   }
@@ -618,6 +634,125 @@ export default class ClaudeChat extends View {
     }
   }
 
+  // The effort the shown session runs at: what /effort set on this model, else the default
+  // Claude's settings keep for the model (local agents only: a container has its own settings).
+  effortNow() {
+    const model = this.modelNow();
+    if (!model) return null;
+    if (this.effort?.model === model) return this.effort.level;
+    // Unknown until the agent is found (a container's settings are its own).
+    if (!this.where || this.where.container) return null;
+    const s = this.claudeSettings;
+    return s?.modelSettings?.[modelId(model)]?.effortLevel ?? s?.effortLevel ?? null;
+  }
+
+  // The model: as the transcript last named it, else (a new session, no transcript yet) the
+  // default in Claude's settings (local agents only).
+  modelNow() {
+    if (this.model) return this.model;
+    if (!this.where || this.where.container) return null;
+    const m = this.claudeSettings?.model;
+    return MODELS.find(([alias]) => alias === m)?.[1] ?? (/^claude-/.test(m ?? "") ? modelLabel(m) : null);
+  }
+
+  // A pick from the model / effort bar, made in Claude's own /model or /effort picker with its
+  // "s" key (this session only): `/model opus`, `/effort high` and a digit in the picker all
+  // also save it as the default for new sessions (Claude 2.1.318, 2026-11-05). The header says
+  // "Switching…" until the transcript shows the change (`pending`), or after 12 s that it didn't.
+  pick(kind, value, address, cx) {
+    this.drop = null;
+    this.pending = { kind, value, address, until: Date.now() + 12000 };
+    this.pickNote = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const screen = async () => (await hc(["read", address])).stdout.replace(/\r/g, "");
+      // Types the command, waits for its picker (`ready` tests the screen), then `keys`.
+      const inPicker = async (command, ready, what) => {
+        await hc(["keys", address, ...command.split("")]);
+        await hc(["keys", address, "enter"]);
+        for (let i = 0; i < 20; i++) {
+          await cx.sleep(150);
+          if (ready(await screen())) return;
+        }
+        await hc(["keys", address, "esc"]);
+        throw new Error(`Claude's ${what} picker didn't open`);
+      };
+      try {
+        if (kind === "model") {
+          // Rows "N.  Opus 5.5   …" (row 1 is "Default (recommended)"); Home goes to row 1.
+          const row = new RegExp(`^\\s*(?:❯\\s*)?(\\d+)\\.\\s+${value.replace(/\./g, "\\.")}\\s`, "m");
+          await inPicker("/model", (s) => /Select model/.test(s) && row.test(s), "model");
+          const n = Number(row.exec(await screen())?.[1] ?? 0);
+          if (!n) throw new Error(`${value} isn't in Claude's /model list`);
+          await hc(["keys", address, "home", ...Array(n - 1).fill("down")]);
+          await cx.sleep(100);
+          // Only on the right row (the list could have moved): else leave it untouched.
+          const at = /^\s*❯\s*\d+\.\s+(.*?)\s{2,}/m.exec(await screen())?.[1];
+          if (at?.replace(/\s*✔$/, "") !== value) { await hc(["keys", address, "esc"]); throw new Error(`Couldn't select ${value}`); }
+          await hc(["keys", address, "s"]);
+        } else {
+          // The effort slider starts at the current level; ← five times is low.
+          await inPicker("/effort", (s) => /Faster[\s\S]*Smarter/.test(s), "effort");
+          await hc(["keys", address, ...Array(5).fill("left"), ...Array(EFFORTS.indexOf(value)).fill("right"), "s"]);
+        }
+        // Mid-conversation Claude asks first ("Change effort level? … the full history gets
+        // re-read on your next message", "❯ 1. Yes, switch to low"): the pick was the answer.
+        for (let i = 0; i < 8; i++) {
+          await cx.sleep(200);
+          if (/^\s*❯\s*1\.\s+Yes, switch/m.test(await screen())) { await hc(["keys", address, "enter"]); break; }
+        }
+      } catch (e) {
+        this.pending = null;
+        this.pickNote = String(e?.message ?? e);
+      }
+      cx.notify();
+    });
+  }
+
+  // Whether the pick in flight has landed (the transcript names it) or timed out.
+  settlePick() {
+    const p = this.pending;
+    if (!p || p.address !== this.address) return;
+    const now = p.kind === "model" ? this.model : this.effortNow();
+    if (now === p.value) this.pending = null;
+    else if (Date.now() > p.until) { this.pending = null; this.pickNote = "No change seen: look at the Terminal"; }
+  }
+
+  // The model and effort dropdowns at the right of the box: the trigger shows the current one
+  // (or "Opus 5.5…" while a pick lands), the list opens upward with the current one ticked.
+  // Picks only while Claude waits for you: a pick while it works would queue behind the turn,
+  // and keys typed into the effort picker would land in its prompt instead.
+  dropdown(t, agent, kind) {
+    const ready = agent.status !== "working" && agent.status !== "blocked";
+    const now = kind === "model" ? this.modelNow() : this.effortNow();
+    const p = this.pending?.address === this.address && this.pending.kind === kind ? this.pending : null;
+    const open = this.drop === kind;
+    const options = kind === "model" ? MODELS.map(([, label]) => label) : EFFORTS;
+    const trigger = h_flex().id(`drop-${kind}-trigger`).flex_none().gap(4).px(8).h(28).items_center().rounded(7)
+      .border(1).border_color(open ? t.accent : t.border).bg(t.background).cursor_pointer()
+      .text_size(px(12)).text_color(p ? t.accent : t.muted)
+      .hover((s) => s.text_color(t.foreground).border_color(t.input))
+      .tooltip(kind === "model" ? "Model (this session only)" : "Effort (this session only)")
+      .child(p ? `${p.value}…` : now ?? (kind === "model" ? "Model" : "Effort"))
+      .child(svg("mods/workspace-chrome/chevron-down.svg").size(12).text_color(t.dim));
+    const row = (value) => h_flex().id(`drop-${kind}-${value}`).gap(8).px(8).h(26).items_center().rounded(5).text_size(px(12.5))
+      .when(value === now, (el) => el.text_color(t.foreground).bg(t.selected))
+      .when(value !== now && ready, (el) => el.cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => { this.drop = null; this.pick(kind, value, agent.address, cx); this.box.focus(); }))
+      .when(value !== now && !ready, (el) => el.text_color(t.dim))
+      .child(div().w(12).flex_none().text_color(t.accent).child(value === now ? "✓" : ""))
+      .child(value);
+    return Popover.new(`drop-${kind}`).anchor("bottom_right")
+      .open(open)
+      .on_open_change((o, cx) => { this.drop = o ? kind : null; this.pickNote = null; cx.notify(); })
+      .trigger(trigger)
+      .content(v_flex().w(kind === "model" ? 190 : 230).p(4).gap(1).mb(6).rounded(8).bg(t.popover).border(1).border_color(t.border)
+        .children(options.map(row))
+        .child(div().px(8).pt(6).pb(2).text_size(px(10.5)).text_color(t.dim)
+          .child(!ready ? "Can change once Claude stops"
+            : kind === "effort" ? "This session only. Mid-chat, the next reply re-reads the history." : "This session only")));
+  }
+
   toTerminal(address) {
     const { stack, other } = props() ?? {};
     if (stack) run("layout.select", { stack, child: other });
@@ -630,6 +765,16 @@ export default class ClaudeChat extends View {
     if (!this.warming) {
       this.warming = true;
       cx.spawn(async () => { try { await this.warm(); await this.scanOthers(); this.publish(); } finally { this.warming = false; } });
+    }
+    // Claude's own settings, for the effort a session starts on (see effortNow), every 30 s.
+    if (Date.now() - (this.claudeSettingsAt ?? 0) > 30000) {
+      this.claudeSettingsAt = Date.now();
+      cx.spawn(async (cx) => {
+        const text = await readFile(`${CLAUDE}/settings.json`, "utf8").catch(() => null);
+        let s = null;
+        try { s = text ? JSON.parse(text) : null; } catch {}
+        if (JSON.stringify(s) !== JSON.stringify(this.claudeSettings)) { this.claudeSettings = s; cx.notify(); }
+      });
     }
     const agent = this.target();
     if ((agent?.address ?? null) !== this.address) { this.reset(agent?.address ?? null); cx.notify(); }
@@ -688,7 +833,8 @@ export default class ClaudeChat extends View {
 
   // What tick and watch can change on screen.
   drawn() {
-    return `${this.address}|${this.version}|${this.problem}|${this.screen}`;
+    // A model / effort pick in flight: its timeout redraws too (see settlePick).
+    return `${this.address}|${this.version}|${this.problem}|${this.screen}|${this.pending ? Date.now() > this.pending.until : ""}`;
   }
 
   async tail(address) {
@@ -854,6 +1000,7 @@ export default class ClaudeChat extends View {
       } else if (d.type === "assistant") {
         // Where a fork made at the next message of yours starts from (see fork).
         if (into === this) this.lastReply = { session: d.sessionId, uuid: d.uuid };
+        if (into === this && /^claude-/.test(d.message?.model ?? "")) this.model = modelLabel(d.message.model);
         for (const b of content ?? []) {
           if (b.type === "text" && b.text.trim()) into.items.push({ kind: "claude", text: b.text.trim() });
           else if (b.type === "tool_use") {
@@ -875,6 +1022,12 @@ export default class ClaudeChat extends View {
     const bash = tag(text, "bash-input");
     if (bash) return into.items.push({ kind: "user", text: `! ${bash}` });
     const out = tag(text, "local-command-stdout") ?? tag(text, "bash-stdout");
+    if (out !== undefined && into === this) {
+      const model = /^(?:Set model to|Kept model as) `([^`]+)`/.exec(out);
+      if (model) this.model = modelLabel(model[1]);
+      const effort = /^Set effort level to (\w+)/.exec(out);
+      if (effort) this.effort = { level: effort[1], model: this.modelNow() };
+    }
     if (out !== undefined) return out && into.items.push({ kind: "note", text: plain(out), mono: true });
     if (text.startsWith("[Request interrupted")) return into.items.push({ kind: "note", text: "Interrupted" });
     if (/^<[\w-]+>/.test(text)) return;
@@ -1612,6 +1765,7 @@ export default class ClaudeChat extends View {
     const status = this.status(t, agent);
     const images = this.imageCount(agent.address);
     const menu = this.menu(t);
+    this.settlePick();
     if (hidden > 0) rows.unshift(h_flex().w_full().justify_center().child(
       this.button(t, "earlier", `Show earlier (${hidden})`, (_e, cx) => { this.limit += PAGE; cx.notify(); })));
 
@@ -1652,6 +1806,7 @@ export default class ClaudeChat extends View {
         .when(Boolean(chips), (el) => el.child(chips))
         .when(Boolean(status), (el) => el.child(status))
         .when(Boolean(this.pasteNote), (el) => el.child(div().px(4).text_size(px(12)).text_color(t.muted).child(this.pasteNote)))
+        .when(Boolean(this.pickNote), (el) => el.child(div().px(4).text_size(px(12)).text_color(t.accent).child(this.pickNote)))
         .when(images > 0, (el) => el.child(h_flex().gap(8).items_center().px(4).text_size(px(12)).text_color(t.muted)
           .child(div().px(8).py(2).rounded(6).bg(t.raised).text_color(t.foreground)
             .child(images === 1 ? "🖼 1 image" : `🖼 ${images} images`))
@@ -1669,7 +1824,9 @@ export default class ClaudeChat extends View {
           .on_action("claude_chat_menu_fill", (_e, cx) => this.menuKey("fill", cx))
           .on_action("claude_chat_menu_close", (_e, cx) => this.menuKey("close", cx))
           .on_action("claude_chat_menu_leave", (_e, cx) => this.menuKey("leave", cx))
+          .gap(6).items_end()
           .child(div().flex_1().min_w(0).p(6).rounded(8).bg(t.background).border(1).border_color(t.input)
-            .child(Textarea.new(this.box)))));
+            .child(Textarea.new(this.box)))
+          .child(h_flex().flex_none().gap(6).pb(4).child(this.dropdown(t, agent, "model")).child(this.dropdown(t, agent, "effort")))));
   }
 }
