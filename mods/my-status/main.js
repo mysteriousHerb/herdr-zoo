@@ -374,6 +374,14 @@ export default class WorkspaceStatus extends View {
   // Which dev container's workspace the bar shows: the focused agent's container, else one an
   // agent in this space runs in, else the container opened on (a parent of) the bar's folder.
   workspace(f, space, folder) {
+    const b = this.box(f, space, folder);
+    if (!b) return null;
+    const dirs = this.dirs[pathKey(b.root)] ?? [];
+    return dirs.length ? { root: b.root, name: baseName(b.root), dirs } : null;
+  }
+
+  // The dev container the bar is about (see workspace), with the agents running in it.
+  box(f, space, folder) {
     if (!this.boxes?.length) return null;
     const map = shared(CONTAINERS) ?? {};
     const box = (tok) => (tok ? this.boxes.find((b) => b.id.startsWith(tok) || b.name === tok) : null);
@@ -381,8 +389,22 @@ export default class WorkspaceStatus extends View {
     if (!b && space) for (const a of agents()) if (a.space === space.id && (b = box(map[a.address]))) break;
     if (!b && folder) b = this.boxes.find((x) => inside(folder, x.local));
     if (!b) return null;
-    const dirs = this.dirs[pathKey(b.root)] ?? [];
-    return dirs.length ? { root: b.root, name: baseName(b.root), dirs } : null;
+    const inIt = agents().filter((a) => box(map[a.address]) === b);
+    return { ...b, agents: inIt };
+  }
+
+  // Rebuild the dev container: a new tab running `devcontainer up --remove-existing-container`
+  // on the folder it was opened from (the + entry's `devcontainer up` reuses the container, so
+  // devcontainer.json changes never landed). It asks first: every agent in the container dies.
+  rebuild(b, space) {
+    const n = b.agents.length;
+    const command = { name: "tab.new", args: { name: "Rebuild dev container", space: space?.id, folder: b.local,
+      argv: ["devcontainer", "up", "--workspace-folder", ".", "--remove-existing-container"] } };
+    openOverlay({
+      mod: "confirm", kind: "dialog", width: 460, height: 170,
+      props: { title: "Rebuild the dev container?", command,
+        detail: `${b.name} is removed and started again from ${b.local}.${n ? ` The ${n === 1 ? "agent" : `${n} agents`} running in it ${n === 1 ? "dies" : "die"} with it.` : ""}` },
+    });
   }
 
   // Sync one repo (its toast as before) or several (one toast for all).
@@ -672,7 +694,8 @@ export default class WorkspaceStatus extends View {
     const f = focused();
     // A dev container's workspace: all its repos in the popup, and on the bar the one picked
     // there (else the focused terminal's), by name.
-    const ws = space && !space.machine ? this.workspace(f, space, folder) : null;
+    const box = space && !space.machine ? this.box(f, space, folder) : null;
+    const ws = box ? this.workspace(f, space, folder) : null;
     const wsKey = ws ? `${ws.root}|${ws.dirs.join("|")}` : "";
     if (wsKey !== this.wsKey) { this.wsKey = wsKey; this.ws = ws; } // readRepos reads this.ws
     const picked = ws ? (shared(SHOWN) ?? {})[pathKey(ws.root)] : null;
@@ -708,6 +731,10 @@ export default class WorkspaceStatus extends View {
             else this.openPage(folder, null, anchor, cx);
           }))))
       .when(Boolean(folder), el => el.child(button("open-folder", "folder", "Folder", "folder")).child(button("open-code", "file-text", "VS Code", "code")))
+      // The focused agent runs in a dev container: a Rebuild button (see rebuild).
+      .when(Boolean(box), el => el.child(label("archive", "Rebuild").id("rebuild").cursor_pointer().hover(s => s.text_color(t.foreground))
+        .tooltip(`Rebuild the dev container ${box.name} (from ${box.local}): removes it and starts a fresh one${box.agents.length ? `; ${box.agents.length} agent${box.agents.length === 1 ? "" : "s"} in it would end` : ""}`)
+        .on_click(() => this.rebuild(box, space))))
       .when(Boolean(pr), el => el.child(label("git-compare", `PR #${pr.number}`).id("open-pr").cursor_pointer()
         .when(prState === "merged", s => s.text_color(t.ansi5)).when(prState === "closed", s => s.text_color(t.dim))
         .hover(s => s.text_color(t.foreground))
