@@ -7,7 +7,7 @@
 // options, then "Type something", then (multi-select only) "Submit". Enter on a multi-select
 // option ticks it and leaves the cursor there. With several questions, ← → move between them
 // and a last "Submit" page reviews the answers ("1. Submit answers  2. Cancel").
-import { div } from "gpui-kit";
+import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import { hc } from "herdr";
 
@@ -113,11 +113,24 @@ export function card(view, t, px) {
   if (w) view.lastAsk = w;
   const wait = !w;
   const many = questions.length > 1;
+  // Folded: the header and the question on one line, so the chat above has the room. Kept per
+  // question (the tool call's id), so the next question opens unfolded.
+  const folded = view.askFolded === item.id;
+  const fold = (_e, cx) => { view.askFolded = folded ? null : item.id; cx.notify(); };
+  const title = many ? "Claude has questions" : "Claude is asking";
+  const current = questions[Math.min(shown.at, questions.length - 1)];
 
   const head = h_flex().gap(8).items_center()
     .child(div().size(8).flex_none().rounded(4).bg(t.blocked).loop("opacity", { from: 0.35, to: 1, period: 1200 }))
-    .child(div().flex_1().min_w(0).font_semibold().text_color(t.foreground).child(many ? "Claude has questions" : "Claude is asking"))
-    .when(many, (el) => el.child(h_flex().flex_none().gap(4)
+    .child(h_flex().id("ask-fold").flex_1().min_w(0).gap(6).items_center().cursor_pointer()
+      .tooltip(folded ? "Show the question" : "Fold the question")
+      .on_click(fold)
+      .child(div().flex_none().font_semibold().text_color(t.foreground).child(title))
+      .when(folded, (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.muted)
+        .child(flat(parts(current?.question).question))))
+      .when(!folded, (el) => el.child(div().flex_1()))
+      .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(12).flex_none().text_color(t.dim)))
+    .when(many && !folded, (el) => el.child(h_flex().flex_none().gap(4)
       .children([...questions.map((q, i) => [q.header || `Q${i + 1}`, i]), ["Submit", questions.length]].map(([label, i]) =>
         div().id(`ask-tab-${i}`).px(8).py(2).rounded(6).text_size(px(11)).cursor_pointer()
           .when(i === shown.at, (el) => el.bg(t.selected).text_color(t.foreground))
@@ -133,6 +146,8 @@ export function card(view, t, px) {
   const box = v_flex().gap(10).p(12).rounded(10).bg(t.surface).border(1).border_color(t.blocked)
     .when(wait, (el) => el.opacity(0.6))
     .child(head);
+
+  if (folded) return box.p(8).gap(0);
 
   if (shown.at === questions.length) {
     return box
