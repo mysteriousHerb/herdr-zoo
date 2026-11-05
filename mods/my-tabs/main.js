@@ -4,7 +4,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props } from "herdr";
+import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props, knownAgents } from "herdr";
 import PACKS from "./sprites.js";
 
 // Every sprite by key "<pack>/<id>" (sprites.js, the zoo's catalog; scripts/make_packs.py).
@@ -35,13 +35,19 @@ function creature(a, box) {
 // A tab Herdr named after its program ("Claude Code", or an automatic "tbN") shows the agent's
 // own title instead, as the agents list does (`title` in zoo-agents): unless that title is
 // only a path, a user@host, or the program's name again. A tab someone renamed keeps its name.
+// "Named after its program" = the pane's program name, or any + menu entry's (`LAUNCHERS`): a
+// "Claude (dev container)" tab runs a pane whose program reports "Claude Code" (seen 2026-11-05).
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+const LAUNCHERS = new Set();
+function loadLaunchers(cx) {
+  cx.spawn(async () => { for (const k of await knownAgents()) LAUNCHERS.add(k.name); });
+}
 function tabName(c, lead) {
   const prog = lead?.program?.name;
   const live = clean(lead?.title);
   const telling = live && live !== prog && !/^[~/]|^[A-Za-z]:\\/.test(live) && !live.includes("@") && live.toLowerCase() !== lead?.program?.key;
   const auto = /^tb\d+$/.test(c.name);
-  if ((auto || c.name === prog) && telling) return live;
+  if ((auto || c.name === prog || LAUNCHERS.has(c.name)) && telling) return live;
   return auto ? prog ?? "Terminal" : c.name;
 }
 
@@ -83,8 +89,9 @@ function find(node, id) {
 }
 
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.pressed = null;
+    loadLaunchers(cx);
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
   }
 
