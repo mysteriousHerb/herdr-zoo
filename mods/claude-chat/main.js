@@ -644,24 +644,28 @@ export default class ClaudeChat extends View {
     }
   }
 
+  // Claude's settings for the shown agent: this computer's ~/.claude/settings.json, or the
+  // container's own (read in tick). Unknown (null) until the agent is found.
+  settingsNow() {
+    if (!this.where) return null;
+    return this.where.container ? this.containerSettings?.[this.where.container]?.s ?? null : this.claudeSettings;
+  }
+
   // The effort the shown session runs at: what /effort set on this model, else the default
-  // Claude's settings keep for the model (local agents only: a container has its own settings).
+  // Claude's settings keep for the model.
   effortNow() {
     const model = this.modelNow();
     if (!model) return null;
     if (this.effort?.model === model) return this.effort.level;
-    // Unknown until the agent is found (a container's settings are its own).
-    if (!this.where || this.where.container) return null;
-    const s = this.claudeSettings;
+    const s = this.settingsNow();
     return s?.modelSettings?.[modelId(model)]?.effortLevel ?? s?.effortLevel ?? null;
   }
 
   // The model: as the transcript last named it, else (a new session, no transcript yet) the
-  // default in Claude's settings (local agents only).
+  // default in Claude's settings.
   modelNow() {
     if (this.model) return this.model;
-    if (!this.where || this.where.container) return null;
-    const m = this.claudeSettings?.model;
+    const m = this.settingsNow()?.model;
     return MODELS.find(([alias]) => alias === m)?.[1] ?? (/^claude-/.test(m ?? "") ? modelLabel(m) : null);
   }
 
@@ -785,6 +789,23 @@ export default class ClaudeChat extends View {
         try { s = text ? JSON.parse(text) : null; } catch {}
         if (JSON.stringify(s) !== JSON.stringify(this.claudeSettings)) { this.claudeSettings = s; cx.notify(); }
       });
+    }
+    // A dev container's Claude has its own settings (its CLAUDE_CONFIG_DIR): read them there,
+    // every 30 s per container (the effort dropdown showed nothing for container agents).
+    const container = this.where?.container;
+    if (container) {
+      const kept = (this.containerSettings ??= {})[container];
+      if (Date.now() - (kept?.at ?? 0) > 30000) {
+        this.containerSettings[container] = { ...kept, at: Date.now() };
+        const where = this.where;
+        cx.spawn(async (cx) => {
+          const r = await inDocker(where, 'cat "$d/settings.json" 2>/dev/null').catch(() => null);
+          let s = null;
+          try { s = r?.stdout?.trim() ? JSON.parse(r.stdout) : null; } catch {}
+          const now = this.containerSettings[container];
+          if (JSON.stringify(s) !== JSON.stringify(now?.s)) { this.containerSettings[container] = { ...now, s }; cx.notify(); }
+        });
+      }
     }
     const agent = this.target();
     if ((agent?.address ?? null) !== this.address) { this.reset(agent?.address ?? null); cx.notify(); }
