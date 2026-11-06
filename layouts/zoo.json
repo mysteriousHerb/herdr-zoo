@@ -102,97 +102,148 @@
           }
         },
         {
-          "id": "work-body",
-          "type": "row",
-          "padding": 8,
-          "gap": 8,
+          "id": "work-split",
+          "type": "column",
+          "divider": {
+            "width": 1,
+            "color": "border"
+          },
           "children": [
             {
-              "id": "views",
-              "type": "stack",
-              "active": "chat",
+              "id": "work-body",
+              "type": "row",
+              "padding": 8,
+              "gap": 8,
               "children": [
                 {
-                  "id": "chat",
-                  "title": "Chat",
-                  "type": "block",
-                  "radius": 10,
-                  "border": {
-                    "width": 1,
-                    "color": "border"
-                  },
-                  "content": {
-                    "mod": "claude-chat",
-                    "props": {
-                      "stack": "views",
-                      "self": "chat",
-                      "other": "main"
-                    }
-                  }
-                },
-                {
-                  "id": "main",
-                  "title": "Terminal",
-                  "type": "block",
-                  "content": {
-                    "tab": "active",
-                    "pane": {
-                      "gap": 8,
+                  "id": "views",
+                  "type": "stack",
+                  "active": "chat",
+                  "children": [
+                    {
+                      "id": "chat",
+                      "title": "Chat",
+                      "type": "block",
                       "radius": 10,
-                      "background": "background",
-                      "lone": true,
                       "border": {
                         "width": 1,
                         "color": "border"
                       },
-                      "focus": {
-                        "width": 1,
-                        "color": "accent"
-                      },
-                      "header": {
-                        "content": {
-                          "mod": "my-pane",
-                          "props": {
-                            "stack": "views",
-                            "other": "chat"
-                          }
-                        },
-                        "height": 30,
-                        "position": "top",
-                        "reveal": "always"
-                      }
-                    }
-                  }
-                }
-              ]
-            },
-            {
-              "id": "panel",
-              "type": "column",
-              "hidden": true,
-              "size": {
-                "px": 368
-              },
-              "min": 280,
-              "max": 900,
-              "children": [
-                {
-                  "id": "panel-body",
-                  "type": "stack",
-                  "active": "files",
-                  "children": [
-                    {
-                      "id": "files",
-                      "type": "block",
                       "content": {
-                        "mod": "files"
+                        "mod": "claude-chat",
+                        "props": {
+                          "stack": "views",
+                          "self": "chat",
+                          "other": "main"
+                        }
                       }
                     },
                     {
-                      "id": "changes",
+                      "id": "main",
+                      "title": "Terminal",
                       "type": "block",
                       "content": {
-                        "mod": "changes"
+                        "tab": "active",
+                        "pane": {
+                          "gap": 8,
+                          "radius": 10,
+                          "background": "background",
+                          "lone": true,
+                          "border": {
+                            "width": 1,
+                            "color": "border"
+                          },
+                          "focus": {
+                            "width": 1,
+                            "color": "accent"
+                          },
+                          "header": {
+                            "content": {
+                              "mod": "my-pane",
+                              "props": {
+                                "stack": "views",
+                                "other": "chat"
+                              }
+                            },
+                            "height": 30,
+                            "position": "top",
+                            "reveal": "always"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "panel",
+                  "type": "column",
+                  "hidden": true,
+                  "size": {
+                    "px": 368
+                  },
+                  "min": 280,
+                  "max": 900,
+                  "children": [
+                    {
+                      "id": "panel-body",
+                      "type": "stack",
+                      "active": "files",
+                      "children": [
+                        {
+                          "id": "files",
+                          "type": "block",
+                          "content": {
+                            "mod": "files"
+                          }
+                        },
+                        {
+                          "id": "changes",
+                          "type": "block",
+                          "content": {
+                            "mod": "changes"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "size": {
+                "weight": 1
+              }
+            },
+            {
+              "id": "tray",
+              "type": "column",
+              "hidden": true,
+              "size": {
+                "px": 300
+              },
+              "min": 120,
+              "children": [
+                {
+                  "id": "tray-head",
+                  "type": "block",
+                  "size": {
+                    "px": 30
+                  },
+                  "content": {
+                    "mod": "quick-term"
+                  }
+                },
+                {
+                  "id": "tray-terms",
+                  "type": "stack",
+                  "active": "qt-none",
+                  "children": [
+                    {
+                      "id": "qt-none",
+                      "type": "block",
+                      "content": {
+                        "mod": "quick-term",
+                        "props": {
+                          "empty": true
+                        }
                       }
                     }
                   ]
