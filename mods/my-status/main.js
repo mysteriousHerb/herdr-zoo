@@ -141,20 +141,95 @@ async function prsFor(list) {
 }
 
 // Running dev containers: [{ id, name, local (the folder it was opened on), root (what its
-// /workspace is on this computer: the bind mount with the shortest /workspace… target) }].
+// /workspace is on this computer: the bind mount with the shortest /workspace… target),
+// created (ms), config (its devcontainer.json on this computer, "" if unknown) }].
 async function devContainers() {
   const ps = await exec("docker", ["ps", "-q", "--filter", "label=devcontainer.local_folder"]);
   const ids = ps.code ? [] : ps.stdout.split(/\s+/).filter(Boolean);
   if (!ids.length) return [];
   const r = await exec("docker", ["inspect", "-f",
-    '{{.Id}}|{{.Name}}|{{index .Config.Labels "devcontainer.local_folder"}}|{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}>{{.Source}};{{end}}{{end}}', ...ids]);
+    '{{.Id}}|{{.Name}}|{{index .Config.Labels "devcontainer.local_folder"}}|{{.Created}}|{{index .Config.Labels "devcontainer.config_file"}}|{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}>{{.Source}};{{end}}{{end}}', ...ids]);
   if (r.code) return [];
   return r.stdout.split("\n").filter((l) => l.includes("|")).map((line) => {
-    const [id, name, local, mounts] = line.trim().split("|");
+    const [id, name, local, created, config, mounts] = line.trim().split("|");
     const work = (mounts ?? "").split(";").filter(Boolean).map((m) => m.split(">"))
       .filter(([to]) => /^\/workspaces?(\/|$)/.test(to)).sort((a, b) => a[0].length - b[0].length)[0];
-    return { id, name: name.replace(/^\//, ""), local: resolvePath(local), root: resolvePath(work?.[1] ?? local) };
+    return { id, name: name.replace(/^\//, ""), local: resolvePath(local), root: resolvePath(work?.[1] ?? local),
+      created: Date.parse(created) || 0, config: config && config !== "<no value>" ? resolvePath(config) : "" };
   });
+}
+
+// Has the dev container's spec changed since the container was built? The spec = every file in
+// its devcontainer.json's folder (.devcontainer: the json, the Dockerfile, the scripts it runs).
+// The first time a container is seen, its baseline is those files' contents, except a file
+// written after the container was created (that one counts as changed); later, any file whose
+// content differs from its baseline. Baselines: shared SPECS = { "<container id>": { "<file>":
+// hash | null } }, so a restart of Herdr doesn't take a changed file as the new baseline.
+const SPECS = "status.boxSpecs";
+function hash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
+}
+const dirOf = (p) => p.slice(0, Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/")));
+
+// { "<file>": hash } for the files in a folder (line endings ignored; folders in it skipped).
+async function specOf(dir) {
+  const out = {};
+  for (const name of await readdir(dir).catch(() => [])) {
+    try { out[name] = hash(String(await readFile(`${dir}/${name}`, "utf8")).replace(/\r/g, "")); } catch {} // a folder
+  }
+  return out;
+}
+
+// The files in a folder written after `since` (ms), or null when that can't be read. fs has no
+// stat here, so it's one shell call, made once per container.
+async function writtenAfter(dir, since) {
+  const r = await (WIN
+    ? exec("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+      `Get-ChildItem -LiteralPath '${dir.replace(/'/g, "''")}' -File | ForEach-Object { $_.Name + '|' + ([DateTimeOffset]$_.LastWriteTimeUtc).ToUnixTimeMilliseconds() }`])
+    : exec("sh", ["-c", 'for f in "$1"/*; do [ -f "$f" ] && echo "${f##*/}|$(date -r "$f" +%s)000"; done', "sh", dir])
+  ).catch(() => ({ code: 1 }));
+  if (r.code) return null;
+  return r.stdout.split("\n").map((l) => l.trim().split("|")).filter(([n, t]) => n && Number(t) > since).map(([n]) => n);
+}
+
+// A file's hash as git had it checked out at `when` (ms): HEAD@{date} goes by the reflog, so a
+// branch switched since still answers with what was checked out then. null when git can't say
+// (not tracked, no repo). A file rewritten with the same content (a pull, a line-ending change)
+// is otherwise taken as changed: seen 2026-11-05 on a Dockerfile touched a week after the build.
+async function committedAt(dir, name, when) {
+  const r = await exec("git", ["show", `HEAD@{${new Date(when).toISOString()}}:./${name}`], { cwd: dir }).catch(() => ({ code: 1 }));
+  return r.code ? null : hash(String(r.stdout).replace(/\r/g, ""));
+}
+const asked = new Set(); // "<id>|<file>": null baselines already asked of git this session
+
+// Sets each box's `changed` (the spec files that differ from its baseline, sorted).
+async function checkSpecs(boxes) {
+  const base = { ...(shared(SPECS) ?? {}) };
+  let dirty = false;
+  if (boxes.length) for (const id of Object.keys(base)) if (!boxes.some((b) => b.id === id)) { delete base[id]; dirty = true; }
+  for (const b of boxes) {
+    b.changed = [];
+    if (!b.config) continue;
+    const dir = dirOf(b.config);
+    const now = await specOf(dir);
+    if (!Object.keys(now).length) continue; // folder not on this computer
+    if (!base[b.id]) {
+      const late = await writtenAfter(dir, b.created);
+      base[b.id] = Object.fromEntries(Object.entries(now).map(([n, h]) => [n, late?.includes(n) ? null : h]));
+      dirty = true;
+    }
+    for (const [n, h] of Object.entries(base[b.id])) {
+      if (h !== null || asked.has(`${b.id}|${n}`)) continue;
+      asked.add(`${b.id}|${n}`);
+      const then = await committedAt(dir, n, b.created);
+      if (then) { base[b.id] = { ...base[b.id], [n]: then }; dirty = true; }
+    }
+    const was = base[b.id];
+    b.changed = [...new Set([...Object.keys(now), ...Object.keys(was)])].filter((n) => was[n] !== now[n]).sort();
+  }
+  if (dirty) setShared(SPECS, base);
 }
 
 // The repos in a workspace folder: it, if it is one, and each folder in it with a .git.
@@ -347,6 +422,7 @@ export default class WorkspaceStatus extends View {
     this.boxing = true;
     cx.spawn(async (cx) => {
       const boxes = await devContainers().catch(() => []);
+      await checkSpecs(boxes).catch(() => {});
       const dirs = {};
       for (const root of new Set(boxes.map((b) => b.root))) dirs[pathKey(root)] = await reposIn(root);
       this.boxing = false;
@@ -403,7 +479,7 @@ export default class WorkspaceStatus extends View {
     openOverlay({
       mod: "confirm", kind: "dialog", width: 460, height: 170,
       props: { title: "Rebuild the dev container?", command,
-        detail: `${b.name} is removed and started again from ${b.local}.${n ? ` The ${n === 1 ? "agent" : `${n} agents`} running in it ${n === 1 ? "dies" : "die"} with it.` : ""}` },
+        detail: `${b.name} is removed and started again from ${b.local}.${b.changed?.length ? ` Changed since it was built: ${b.changed.join(", ")}.` : ""}${n ? ` The ${n === 1 ? "agent" : `${n} agents`} running in it ${n === 1 ? "dies" : "die"} with it.` : ""}` },
     });
   }
 
@@ -731,9 +807,13 @@ export default class WorkspaceStatus extends View {
             else this.openPage(folder, null, anchor, cx);
           }))))
       .when(Boolean(folder), el => el.child(button("open-folder", "folder", "Folder", "folder")).child(button("open-code", "file-text", "VS Code", "code")))
-      // The focused agent runs in a dev container: a Rebuild button (see rebuild).
-      .when(Boolean(box), el => el.child(label("archive", "Rebuild").id("rebuild").cursor_pointer().hover(s => s.text_color(t.foreground))
-        .tooltip(`Rebuild the dev container ${box.name} (from ${box.local}): removes it and starts a fresh one${box.agents.length ? `; ${box.agents.length} agent${box.agents.length === 1 ? "" : "s"} in it would end` : ""}`)
+      // The focused agent runs in a dev container: a Rebuild button (see rebuild), in the accent
+      // with a dot when its .devcontainer files changed since it was built (checkSpecs).
+      .when(Boolean(box), el => el.child(label("archive", "Rebuild").id("rebuild").cursor_pointer()
+        .when(Boolean(box.changed?.length), s => s.text_color(t.accent).child(div().size(6).rounded(3).bg(t.accent)))
+        .hover(s => s.text_color(t.foreground))
+        .tooltip([box.changed?.length ? `The dev container spec changed since ${box.name} was built (${ago(box.created)}): ${box.changed.join(", ")}. Rebuild to apply it.` : null,
+          `Rebuild the dev container ${box.name} (from ${box.local}): removes it and starts a fresh one${box.agents.length ? `; ${box.agents.length} agent${box.agents.length === 1 ? "" : "s"} in it would end` : ""}`].filter(Boolean).join("\n"))
         .on_click(() => this.rebuild(box, space))))
       .when(Boolean(pr), el => el.child(label("git-compare", `PR #${pr.number}`).id("open-pr").cursor_pointer()
         .when(prState === "merged", s => s.text_color(t.ansi5)).when(prState === "closed", s => s.text_color(t.dim))

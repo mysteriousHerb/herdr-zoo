@@ -3,6 +3,16 @@
 // "Claude (dev container)" is opt-in per computer: it shows only when that computer's own
 // programs.json defines `claude-dev-container` (the chat's ⚙ adds or removes it). No folder
 // check here: an `exists` on every menu open slowed Herdr down.
+// With it comes "Terminal (dev container)" under Terminal: a bash in the same container
+// (`devcontainer up` reuses a running one), on the folder the Claude entry names.
+
+// The dev container terminal's command, from the Claude entry's (so a hand-edited folder
+// follows): its `--workspace-folder`, `devcontainer up`, then `devcontainer exec … bash -l`.
+function devTerminal(entry) {
+  const line = (entry?.run ?? []).join(" ");
+  const folder = /--workspace-folder\s+("[^"]+"|\S+)/.exec(line)?.[1] ?? "..\\harness-agent";
+  return ["cmd.exe", "/c", `devcontainer up --workspace-folder ${folder} && devcontainer exec --workspace-folder ${folder} bash -l`];
+}
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
@@ -33,8 +43,9 @@ export default class NewMenu extends View {
     const order = ["claude", "claude-dev-container", "codex", "opencode"];
     const installed = order.map(k => this.agents.find(a => a.key === k && a.installed)).filter(Boolean);
     const choices = installed;
+    const dev = installed.find(a => a.key === "claude-dev-container");
     const mod = window()?.platform === "macos" ? "⌘" : "Ctrl";
-    return v_flex().min_h(0).w_full().h(Math.min(491, 167 + Math.max(1, choices.length) * 31)).bg(t.popover).p(5).text_size(12.8)
+    return v_flex().min_h(0).w_full().h(Math.min(522, 167 + (dev ? 31 : 0) + Math.max(1, choices.length) * 31)).bg(t.popover).p(5).text_size(12.8)
       .id("new-menu").track_focus(this.handle)
       .on_key_down((e) => {
         if (!e.modifiers.control && !e.modifiers.platform) return;
@@ -46,6 +57,8 @@ export default class NewMenu extends View {
         else run("space.new");
       })
       .child(this.row("terminal", svg("icons/shell.svg").size(14), "Terminal", () => run("tab.new", { space: space?.id }), `${mod} T`))
+      .when(Boolean(dev), el => el.child(this.row("terminal-dev", svg("icons/shell.svg").size(14), "Terminal (dev container)",
+        () => run("tab.new", { name: "Terminal (dev container)", space: space?.id, argv: devTerminal(dev) }))))
       .child(div().px(9).pt(8).pb(4).text_size(11).text_color(t.dim).child("Start an agent"))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar()
         .children(choices.map((a, i) => this.row(a.key, a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14), a.name,
