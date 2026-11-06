@@ -472,6 +472,8 @@ export default class ClaudeChat extends View {
     this.typed = ""; this.menuAt = 0; this.menuOff = false;
     // The "/word" being typed, anywhere in the box (see slashAt), or null.
     this.slash = null;
+    // The right-click menu over the log: { x, y (in the log), text (the message under the pointer) }.
+    this.ctx = null;
     // A redraw rebuilds every message, so typing redraws only for the / menu, the one thing
     // that depends on what's typed (the box draws its own text).
     this.box.on("change", (_e, cx) => {
@@ -506,6 +508,8 @@ export default class ClaudeChat extends View {
         ["escape", "claude_chat_menu_close"], ["left", "claude_chat_menu_leave"], ["right", "claude_chat_menu_leave"],
         ["home", "claude_chat_menu_leave"], ["end", "claude_chat_menu_leave"],
       ].map(([keystroke, action]) => ({ keystroke, action, context: `ChatSlash > ${box}` }))));
+      // Esc while Claude works = Stop (the composer is "ChatStop" then, with the menu closed).
+      cx.bind_keys(["Input", "Textarea", "TextArea"].map((box) => ({ keystroke: "escape", action: "claude_chat_stop", context: `ChatStop > ${box}` })));
     } catch {}
     // Search (Ctrl+F, or the header's magnifier): findQ is the query in use (typing settles for
     // 150 ms first, since a redraw rebuilds every message), findList its hits oldest first
@@ -1257,6 +1261,7 @@ export default class ClaudeChat extends View {
       // Full width on the left: a box like the VS Code extension's, tinted with the accent, or a bar.
       const mine = chatLook().mine;
       return div().w_full().px(12).py(8).text_color(t.foreground)
+        .on_mouse_down("right", (e) => this.ctxHit(e, item))
         .when(mine === "box", (el) => el.rounded(8).bg(t.surface).border(1).border_color(t.border))
         .when(mine === "tint", (el) => el.rounded(8).bg(fade(t.accent, "1f")).border(1).border_color(fade(t.accent, "59")))
         .when(mine === "bar", (el) => el.border_l(3).border_color(t.accent))
@@ -1272,6 +1277,7 @@ export default class ClaudeChat extends View {
     }
     if (item.kind === "claude") {
       return h_flex().w_full().gap(8).items_start()
+        .on_mouse_down("right", (e) => this.ctxHit(e, item))
         .child(div().mt(4).size(8).flex_none().rounded(4).bg(t.accent))
         .child(div().flex_1().min_w(0).text_color(t.foreground).child(TextView.markdown(`md-${i}`,
           this.markIn(i) ? markMarkdown(item.text, this.marks.re, this.markIn(i)) : item.text).selectable(true)));
@@ -1473,7 +1479,9 @@ export default class ClaudeChat extends View {
       .when(!this.stuck, (el) => el.child(this.button(t, "stop", "Stop", (_e, cx) => this.stop(cx))));
   }
 
-  // Esc, not `hc interrupt`: that presses Ctrl+C for Claude, and a second one quits it.
+  // The Stop button, and Esc in the chat while Claude works (bound in init; the find bar and the
+  // / menu take their own Esc first). Esc, not `hc interrupt`: that presses Ctrl+C for Claude,
+  // and a second one quits it.
   stop(cx) {
     const address = this.address;
     cx.spawn(async () => { await hc(["keys", address, "esc"]); });
@@ -1558,7 +1566,8 @@ export default class ClaudeChat extends View {
     const key = sub ? `${agent.address}-${sub.name}` : agent.address;
     return div().id(`log-${key}`).relative().flex_1().min_h(0).overflow_hidden()
       .on_size_change((s, cx) => { this.viewH = s.height; this.viewW = s.width; this.up = clamp(this.up ?? 0); cx.notify(); })
-      .on_scroll_wheel((e, cx) => { this.up = clamp((this.up ?? 0) + e.delta.y); cx.notify(); })
+      .on_scroll_wheel((e, cx) => { this.up = clamp((this.up ?? 0) + e.delta.y); this.ctx = null; cx.notify(); })
+      .on_mouse_down("right", (e, cx) => this.openCtx(e, cx))
       .child(v_flex().id(`log-body-${key}`).absolute().left(0).right(0).bottom(-(this.up ?? 0))
         .px(chatLook().width === "narrow" ? Math.max(16, ((this.viewW ?? 0) - NARROW) / 2) : 16).py(12).gap(GAPS[chatLook().space] ?? 10)
         .on_size_change((s, cx) => {
@@ -1570,6 +1579,7 @@ export default class ClaudeChat extends View {
         })
         .when(Boolean(this.problem) && !this.items.length && !sub, (el) => el.child(div().text_color(t.dim).child(this.problem)))
         .children(rows))
+      .when(Boolean(this.ctx), (el) => el.child(this.ctxMenu(t)))
       .when(this.up > 40, (el) => {
         const prev = this.prevMine();
         const to = prev === null ? null : clamp(prev);
@@ -1579,6 +1589,57 @@ export default class ClaudeChat extends View {
           .child(h_flex().absolute().bottom(10).left(0).right(0).justify_center()
             .child(this.button(t, "newest", "↓ Newest", (_e, cx) => { this.up = 0; cx.notify(); }, true)));
       });
+  }
+
+  // ---- the right-click menu
+
+  // A right-click on a message: the menu is about this message. The log's handler (openCtx) runs
+  // too, in either order: whichever comes second completes the other's half.
+  ctxHit(e, item) {
+    if (this.ctx && this.ctx.at.x === e.position.x && this.ctx.at.y === e.position.y) this.ctx.text = item.text;
+    else this.ctxItem = { at: e.position, text: item.text };
+  }
+
+  // A right-click anywhere in the log opens the menu there. The selected text can't be had: a
+  // TextView has no selection API, and running Herdr's copy from here (terminal.copy, the
+  // shell_root::Copy and input::Copy actions Ctrl+C goes through) left the clipboard untouched
+  // (tried 2026-11-06), so the menu works on whole messages.
+  openCtx(e, cx) {
+    const hit = this.ctxItem;
+    // The position comes in window pixels; lengths are laid out at the zoom (as my-tabs does).
+    const z = settings().zoom || 1;
+    const local = e.local_position ?? { x: 0, y: 0 };
+    const text = hit && hit.at.x === e.position.x && hit.at.y === e.position.y ? hit.text : null;
+    this.ctxItem = null;
+    this.ctx = { at: e.position, x: local.x / z, y: local.y / z, text };
+    cx.notify();
+  }
+
+  // Copy message = the whole message as written (markdown); Quote in chat = it goes into the box
+  // as a "> " quote. A press anywhere else closes the menu.
+  ctxMenu(t) {
+    const W = 200, H = 2 * 27 + 8;
+    const x = Math.max(0, Math.min(this.ctx.x, (this.viewW ?? W) - W));
+    const y = this.ctx.y + H > (this.viewH ?? 0) ? Math.max(0, this.ctx.y - H) : this.ctx.y;
+    const close = (cx) => { this.ctx = null; cx.notify(); };
+    const text = this.ctx.text;
+    const row = (id, label, onClick) => h_flex().id(`ctx-${id}`).h(26).px(8).gap(8).items_center().rounded(5)
+      .text_size(px(12.5)).text_color(text ? t.foreground : t.dim)
+      .when(Boolean(text), (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { onClick(cx); close(cx); }))
+      .child(label);
+    return v_flex().id("ctx-menu").absolute().left(x).top(y).w(W).p(4).gap(1).rounded(8)
+      .bg(t.popover).border(1).border_color(t.border).shadow_md()
+      .on_mouse_down_out((_e, cx) => close(cx))
+      .child(row("copy-msg", "Copy message", (cx) => cx.write_to_clipboard(text)))
+      .child(row("quote", "Quote message in chat", () => this.quote(text)));
+  }
+
+  // Puts text into the box as a markdown quote, after what's there, and gives the box the keyboard.
+  quote(text) {
+    const quoted = text.trim().split(/\r?\n/).map((l) => `> ${l}`).join("\n");
+    const had = this.box.value();
+    this.box.set_value(had.trim() ? `${had.replace(/\s+$/, "")}\n\n${quoted}\n\n` : `${quoted}\n\n`);
+    this.box.focus();
   }
 
   // The `up` that puts the nearest of your messages starting above the view at its top, or null
@@ -1780,6 +1841,7 @@ export default class ClaudeChat extends View {
     // Ctrl+F from anywhere in the chat (the box, the search box) opens the search, or goes back to it.
     return root.id("chat-root").track_focus(this.rootKeys)
       .on_key_down((e, cx) => {
+        if (e.keystroke === "escape" && agent.status === "working" && !this.stuck && !menu) { cx.stop_propagation(); this.stop(cx); return; }
         if (!["ctrl-f", "cmd-f"].includes(e.keystroke)) return;
         cx.stop_propagation();
         this.openFind(cx);
@@ -1827,6 +1889,8 @@ export default class ClaudeChat extends View {
         // No Send button: Enter sends (the placeholder says so).
         .child(h_flex().id("composer").track_focus(this.keyboard)
           .when(Boolean(menu), (el) => el.key_context("ChatSlash"))
+          .when(!menu && agent.status === "working" && !this.stuck, (el) => el.key_context("ChatStop"))
+          .on_action("claude_chat_stop", (_e, cx) => this.stop(cx))
           .on_action("claude_chat_menu_down", (_e, cx) => this.menuKey("down", cx))
           .on_action("claude_chat_menu_up", (_e, cx) => this.menuKey("up", cx))
           .on_action("claude_chat_menu_fill", (_e, cx) => this.menuKey("fill", cx))
