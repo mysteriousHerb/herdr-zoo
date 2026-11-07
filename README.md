@@ -61,13 +61,14 @@ deletes. Herdr reloads within a second. Then switch layouts with **Ctrl+Shift+L*
 ### Claude (dev container) (optional)
 
 The + menu can offer a "Claude (dev container)" entry that runs
-`devcontainer up` + `devcontainer exec … claude` on a `harness-agent` checkout next to the
-space's folder (`..\harness-agent`). It is on by default (Windows): the first run adds the
-entry to `~/.config/herdr-app/programs.json`. To hide it, use the chat's ⚙ (top right of the
-Chat view), **+ menu → Claude (dev container) → Off**, which removes the entry (the rest of the
-file is kept) and is remembered. To point it at your own dev container, edit the entry's `run` line in that file
-(turning it on again won't overwrite it), and the matching `devcontainer exec` line in
-`mods/claude-chat/main.js` (used when forking a container chat).
+`devcontainer up` + `devcontainer exec … claude` on the space's folder, so it works for any
+space whose folder holds a `.devcontainer` (the standard VS Code layout; it needs the
+devcontainer CLI and Docker on this computer). It is on by default (Windows): the first run
+adds the entry to `~/.config/herdr-app/programs.json`. To hide it, use the chat's ⚙ (top right
+of the Chat view), **+ menu → Claude (dev container) → Off**, which removes the entry (the rest
+of the file is kept) and is remembered. To run it on another folder, edit the entry's
+`--workspace-folder` in that file (turning it on again won't overwrite it; "Terminal (dev
+container)" follows it, a fork of a container chat does not: it always uses the space's folder).
 
 ## Status
 
