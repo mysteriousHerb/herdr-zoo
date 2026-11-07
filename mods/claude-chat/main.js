@@ -57,13 +57,17 @@ async function syncForeground() {
 syncForeground();
 // "Claude (dev container)" in the + menu (`my-new-menu`), switched in the ⚙ popup: on = this
 // computer's programs.json has the entry, so that file is the setting. On by default (the user's
-// choice 2026-11-02; it needs a harness-agent checkout beside the space's folder): the first run
+// choice 2026-11-02; the space's folder must hold the .devcontainer, the standard VS Code layout): the first run
 // on Windows (the command is cmd.exe) adds it, once; shared `chat.devContainer` remembers that a
 // choice was made, so Off sticks. Turning it on leaves an entry edited by hand alone; off removes
 // it. Herdr reloads programs.json live.
 const DEV_KEY = "claude-dev-container";
 const DEV_ENTRY = { name: "Claude (dev container)", icon: "icons/claude.svg", tint: false,
-  run: ["cmd.exe", "/c", "devcontainer up --workspace-folder ..\\harness-agent && devcontainer exec --workspace-folder ..\\harness-agent claude"] };
+  run: ["cmd.exe", "/c", "devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . claude"] };
+// The entry as it was until 2026-11-07 (a harness-agent checkout beside the space's folder,
+// which only worked because the space's folder was itself named harness-agent): an entry
+// still exactly like it is moved to the new one, once; an edited one is left alone.
+const OLD_RUN = ["cmd.exe", "/c", "devcontainer up --workspace-folder ..\\harness-agent && devcontainer exec --workspace-folder ..\\harness-agent claude"];
 const programsPath = () => `${appHome()}/programs.json`;
 async function devContainerOn() {
   return Boolean(JSON.parse((await readTextFile(programsPath())) ?? "{}").programs?.[DEV_KEY]);
@@ -73,7 +77,8 @@ async function setDevContainer(on) {
     const text = await readTextFile(programsPath());
     const p = JSON.parse(text ?? "{}");
     const programs = { ...(p.programs ?? {}) };
-    if (Boolean(programs[DEV_KEY]) === on) return;
+    const stale = on && JSON.stringify(programs[DEV_KEY]?.run) === JSON.stringify(OLD_RUN);
+    if (Boolean(programs[DEV_KEY]) === on && !stale) return;
     if (on) programs[DEV_KEY] = DEV_ENTRY;
     else delete programs[DEV_KEY];
     if (Object.keys(programs).length) p.programs = programs;
@@ -88,6 +93,8 @@ const DEV_CHOICE = "chat.devContainer";
 if (shared(DEV_CHOICE) == null && /^win/.test(os.platform())) {
   setShared(DEV_CHOICE, true);
   setDevContainer(true).catch(() => {});
+} else if (shared(DEV_CHOICE) === true) {
+  setDevContainer(true).catch(() => {}); // moves an OLD_RUN entry to the new one
 }
 // null = the theme's own accent.
 const ACCENTS = { theme: null, claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
@@ -196,19 +203,23 @@ function inDocker(where, script, ...args) {
     "sh", "-c", `d=\${1:-$HOME/.claude}; ${script}`, "sh", where.dir, ...args]);
 }
 
-// The container's Claude: a container's ~/.claude can be shared with others (a volume) and
-// run several Claudes, so it's the session that started right after this `docker exec`.
-async function inContainer(where, started) {
-  const r = await inDocker(where, 'for f in "$d"/sessions/*.json; do p=${f##*/}; printf "%s " "${p%.json}"; tr -d "\\n" < "$f"; echo; done');
-  let best = null;
-  for (const line of r.stdout.split("\n")) {
-    const m = /^(\d+) (\{.*\})$/.exec(line.trim());
-    let s;
-    try { s = m && JSON.parse(m[2]); } catch { continue; }
-    const gap = (s?.startedAt ?? 0) - started;
-    if (s && gap > -5000 && gap < 120000 && (!best || Math.abs(gap) < best.gap)) best = { pid: Number(m[1]), gap };
-  }
-  return best && { ...where, pid: best.pid };
+// The claude args of a `docker exec … claude …` line, for telling execs apart.
+const claudeArgs = (cmd) => (/\sclaude(\s.*)?$/.exec(cmd)?.[1] ?? "").replace(/["']/g, "").replace(/\s+/g, " ").trim();
+
+// The container's Claude. Its ~/.claude can be a volume shared by several containers, each
+// running Claudes with the same low pids, so sessions/<pid>.json is overwritten by whichever
+// wrote last and can't be trusted. Instead, among the container's own `claude` processes
+// started by an exec (parent pid 0) with the same args as this agent's `docker exec … claude …`
+// (`p`), the one that started nearest to when the exec did (normally a second apart; after
+// the computer slept the clocks can disagree by hours, then the nearest is still the best guess).
+async function inContainer(where, p) {
+  const args = claudeArgs(p.cmd);
+  const r = await inDocker(where, 'now=$(date +%s); ps -eo pid=,ppid=,etimes=,args= | while read pid ppid et cmd; do [ "$ppid" = 0 ] && case "$cmd" in claude|"claude "*) echo "$pid $((now-et)) $cmd";; esac; done; true');
+  const claudes = r.stdout.split("\n").map((l) => /^(\d+) (\d+) claude(.*)$/.exec(l.trim())).filter(Boolean)
+    .map((m) => ({ pid: Number(m[1]), start: Number(m[2]) * 1000, args: claudeArgs(` claude${m[3]}`) }))
+    .filter((c) => c.args === args)
+    .sort((a, b) => Math.abs(a.start - p.start) - Math.abs(b.start - p.start) || b.pid - a.pid);
+  return claudes.length ? { ...where, pid: claudes[0].pid } : null;
 }
 
 // Where the Claude running in `address` keeps its session: here (~/.claude/sessions/<pid>.json),
@@ -224,7 +235,7 @@ async function locate(address, tree = null) {
     for (const p of tree.get(queue.shift()) ?? []) {
       if (known.has(p.pid)) return { pid: p.pid };
       const docker = dockerExec(p.cmd);
-      if (docker) return inContainer(docker, p.start);
+      if (docker) return inContainer(docker, p);
       queue.push(p.pid);
     }
   }
@@ -264,12 +275,23 @@ async function transcriptOf(session) {
   return null;
 }
 
-// The session a Claude is on now ({ sessionId, cwd, … }), from its sessions/<pid>.json.
+// The session a Claude is on now ({ sessionId, cwd, … }): here from its sessions/<pid>.json;
+// in a container from the process itself (sessions/<pid>.json there may be another container's,
+// see inContainer): the session id is in the path of its open <tmp>/claude-<uid>/<folder>/
+// <session id>/tasks file, the cwd is /proc/<pid>/cwd. The file is the fallback.
 async function sessionOf(where) {
-  const text = where.container
-    ? (await inDocker(where, 'cat "$d/sessions/$2.json"', String(where.pid))).stdout
-    : await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
-  try { return text ? JSON.parse(text) : null; } catch { return null; }
+  if (!where.container) {
+    const text = await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
+    try { return text ? JSON.parse(text) : null; } catch { return null; }
+  }
+  const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); if [ -n \"$s\" ] && [ -n \"$c\" ]; then printf '{\"sessionId\":\"%s\",\"cwd\":\"%s\",\"pid\":%s}' \"$s\" \"$c\" \"$p\"; else printf '{\"ns\":\"%s\",\"file\":' \"$n\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"; fi", String(where.pid));
+  let j;
+  try { j = JSON.parse(r.stdout); } catch { return null; }
+  if (j?.sessionId) return j;
+  // No tasks file to go by (an older Claude, or a resumed one): the session file, if it is this
+  // container's (its pidDomain names the pid namespace), else nothing rather than another's.
+  const file = j?.file;
+  return file?.sessionId && (!file.pidDomain || !j.ns || file.pidDomain.endsWith(j.ns)) ? file : null;
 }
 
 // Its transcript; in a container, relative to its Claude folder (read through docker).
@@ -828,11 +850,7 @@ export default class ClaudeChat extends View {
         }
         const where = this.where;
         if (where && this.address === address) {
-          const text = where.container
-            ? (await inDocker(where, 'cat "$d/sessions/$2.json"', String(where.pid))).stdout
-            : await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
-          let session = null;
-          try { session = text && JSON.parse(text); } catch {}
+          const session = await sessionOf(where);
           if (this.address !== address) return;
           if (!session) { this.where = null; this.looked = 0; }
           else if (session.sessionId !== this.session?.sessionId || !this.file) {
@@ -1108,6 +1126,19 @@ export default class ClaudeChat extends View {
     cx.notify();
   }
 
+  // Claude's terminal can be left in one of its own boxes by a stray key (Ctrl+R = "Filter
+  // history", seen 2026-11-07: Herdr still says idle, and a send just types into the box, so the
+  // chat looked dead). Its footer says "Esc to cancel": press Esc (twice at most) before sending.
+  async leaveMenu(address, cx) {
+    for (let i = 0; i < 2; i++) {
+      const r = await hc(["read", address]).catch(() => null);
+      const tail = (r?.stdout ?? "").replace(/\r/g, "").trim().split("\n").slice(-4).join("\n");
+      if (!/\bEsc to (cancel|exit|close|go back)\b/i.test(tail)) return;
+      await hc(["keys", address, "esc"]);
+      await cx.sleep(250);
+    }
+  }
+
   send(cx) {
     const text = this.box.value().trim();
     if (!this.address || (!text && !this.imageCount(this.address))) return;
@@ -1123,7 +1154,11 @@ export default class ClaudeChat extends View {
     this.pasted.delete(address);
     const message = [text, ...files.map((f) => `[Image: ${f}]`)].filter(Boolean).join("\n");
     // Pasted images are already in Claude's prompt: Enter alone sends them.
-    cx.spawn(async () => { await hc(message ? ["send", address, message] : ["keys", address, "enter"]); });
+    const idle = this.target()?.status === "idle";
+    cx.spawn(async (cx) => {
+      if (idle) await this.leaveMenu(address, cx);
+      await hc(message ? ["send", address, message] : ["keys", address, "enter"]);
+    });
     // These open a menu or a screen in Claude's terminal: show it there.
     if (OPENS.has(text.slice(1))) this.toTerminal(address);
     cx.notify();
@@ -1228,7 +1263,7 @@ export default class ClaudeChat extends View {
       const name = `${agent.title || "Claude"} (fork)`;
       if (where?.container) {
         run("tab.new", { name, space: agent.space,
-          argv: ["cmd.exe", "/c", `devcontainer exec --workspace-folder ..\\harness-agent claude ${args.join(" ")}`] });
+          argv: ["cmd.exe", "/c", `devcontainer exec --workspace-folder . claude ${args.join(" ")}`] });
       } else {
         run("tab.new", { name, space: agent.space, folder: session.cwd, argv: ["claude", ...args] });
       }

@@ -10,7 +10,7 @@
 // follows): its `--workspace-folder`, `devcontainer up`, then `devcontainer exec … bash -l`.
 function devTerminal(entry) {
   const line = (entry?.run ?? []).join(" ");
-  const folder = /--workspace-folder\s+("[^"]+"|\S+)/.exec(line)?.[1] ?? "..\\harness-agent";
+  const folder = /--workspace-folder\s+("[^"]+"|\S+)/.exec(line)?.[1] ?? ".";
   return ["cmd.exe", "/c", `devcontainer up --workspace-folder ${folder} && devcontainer exec --workspace-folder ${folder} bash -l`];
 }
 
