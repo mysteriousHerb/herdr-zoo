@@ -957,7 +957,7 @@ export default class ClaudeChat extends View {
   drawn() {
     // A model / effort pick in flight: its timeout redraws too (see settlePick).
     const agent = this.target();
-    const queued = agent ? this.queuedNow(agent).map((q) => `${q.at}:${Boolean(q.sent)}`).join(",") : "";
+    const queued = agent ? this.queuedNow(agent).map((q) => `${q.at}:${Boolean(q.acting)}`).join(",") : "";
     return `${this.address}|${this.version}|${this.problem}|${this.screen}|${this.pending ? Date.now() > this.pending.until : ""}|${queued}`;
   }
 
@@ -1091,6 +1091,8 @@ export default class ClaudeChat extends View {
   // `into`: this chat, or a sub-agent (whose lines are all "sidechain" ones).
   ingest(chunk, into = this) {
     for (const line of chunk.split("\n")) {
+      // Claude's queue of messages sent during a turn (see queueOp).
+      if (into === this && line.startsWith('{"type":"queue-operation"')) { this.queueOp(line); continue; }
       // The conversation's lines; the rest (api requests, snapshots, modes) start with "type".
       if (!line.startsWith('{"parentUuid"')) continue;
       this.version = (this.version ?? 0) + 1;
@@ -1139,6 +1141,9 @@ export default class ClaudeChat extends View {
 
   // What the person typed, or what Claude Code put in their turn (slash commands, ! commands).
   said(raw, into = this, before = undefined) {
+    // A message sent during a turn reaches Claude inside a reminder, at its next step.
+    const mid = /<system-reminder>\s*The user sent a new message while you were working:\n([\s\S]*?)\n\nThis is how Claude Code surfaces/.exec(raw);
+    if (mid) return into.items.push({ kind: "user", text: mid[1].trim(), mid: true, before });
     const text = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
     if (!text || text.startsWith("<local-command-caveat>")) return;
     const command = tag(text, "command-name");
@@ -1403,6 +1408,8 @@ export default class ClaudeChat extends View {
         .child(h_flex().w_full().gap(8).items_center()
           .child(div().flex_1().min_w(0).child(TextView.markdown(`me-${i}`,
             this.markIn(i) ? plainMarked(item.text, this.marks.re, this.markIn(i)) : plainMarkdown(item.text)).selectable(true)))
+          // Sent while Claude worked: it read this at its next step, not as a turn of its own.
+          .when(Boolean(item.mid), (el) => el.child(div().flex_none().text_size(px(11)).text_color(t.dim).tooltip("Sent while Claude was working; it read it at its next step").child("mid-turn")))
           .when(Boolean(item.before && this.agentNow), (el) => el.child(div().id(`fork-${i}`).flex_none().p(2).rounded(4)
             .text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Fork from here: a copy of the conversation up to just before this message, in a new tab")
@@ -1517,33 +1524,68 @@ export default class ClaudeChat extends View {
   // The shown agent's sub-agents at work, over the box; click one to open it.
   // ---- queued messages (sent while Claude works)
 
-  // Claude's terminal keeps a message typed during a turn as a queued message and takes it when
-  // the turn ends (or right away: Enter on its empty prompt, "Send now" here). Until the
-  // transcript shows it, the log shows it dimmed at the bottom. Per agent, kept across switches.
+  // A message sent while Claude works (Enter, here or in its terminal) goes into Claude's queue
+  // and reaches it at its next step, inside a reminder (`mid` messages in said; "absorbed" in
+  // the transcript), or when the turn ends (ctrl+x enter queues it until then). Claude logs the
+  // queue in the transcript as queue-operation lines (enqueue; dequeue / remove when taken), so
+  // those drive the list (queueOp); a send from here is listed at once and matched to its
+  // enqueue. Shown dimmed at the bottom of the log. Per agent, kept across switches.
   queueFor(address) {
     this.queues ??= new Map();
     if (!this.queues.has(address)) this.queues.set(address, []);
     return this.queues.get(address);
   }
 
-  // The agent's queued messages still waiting: one delivered is in the transcript (its text, on
-  // its own or joined with others), and one Claude no longer holds (removed in the terminal, or
-  // taken by a turn that ended) is gone 5 s after the agent stops working.
+  queueOp(line) {
+    let d;
+    try { d = JSON.parse(line); } catch { return; }
+    const text = typeof d.content === "string" ? d.content.trim() : "";
+    if (!text) return;
+    const list = this.queueFor(this.address);
+    const at = Date.parse(d.timestamp) || Date.now();
+    if (d.operation === "enqueue") {
+      // Old lines are read on load too: their enqueues are long taken (or lost).
+      if (Date.now() - at > 3600000) return;
+      const mine = list.find((q) => q.text === text && !q.logged);
+      if (mine) Object.assign(mine, { logged: true, at });
+      else list.push({ text, at, logged: true });
+    } else {
+      const i = list.findIndex((q) => q.text === text);
+      if (i >= 0) list.splice(i, 1);
+    }
+    this.version = (this.version ?? 0) + 1;
+  }
+
+  // The agent's queued messages still waiting: one the transcript shows delivered (its text, on
+  // its own or joined with others) is gone, and so is any left when the agent stopped working
+  // for 5 s (edited away in the terminal; a remove line should have come).
   queuedNow(agent) {
     const list = this.queues?.get(agent.address);
     if (!list?.length) return [];
     const recent = this.items.slice(-40).filter((x) => x.kind === "user").map((x) => x.text);
     const now = Date.now();
     const kept = list.filter((q) => !recent.some((u) => u.includes(q.text))
-      && (agent.status === "working" || now - q.at < 5000) && !(q.sent && now - q.sent > 8000));
+      && (agent.status === "working" || now - q.at < 5000) && !(q.acting && now - q.acting > 8000));
     if (kept.length !== list.length) this.queues.set(agent.address, kept);
     return kept;
   }
 
-  // Enter on Claude's empty prompt sends its queued messages right away (steering).
+  // ctrl+enter (Claude's chat:sendNow) gives it the queued messages right away: the transcript
+  // then logs them removed, "absorbed_mid_turn". Enter on the empty prompt, which the hint under
+  // a queued message names, did nothing (tried 2026-11-09).
   sendNow(agent, cx) {
-    for (const q of this.queueFor(agent.address)) q.sent ??= Date.now();
-    cx.spawn(async () => { await hc(["keys", agent.address, "enter"]); });
+    for (const q of this.queueFor(agent.address)) q.acting ??= Date.now();
+    cx.spawn(async () => { await hc(["keys", agent.address, "ctrl+enter"]); });
+    cx.notify();
+  }
+
+  // Up in Claude's empty prompt takes the newest queued message back into the prompt to edit
+  // (a popAll line), and ctrl+u empties the prompt (ctrl+l, Claude's chat:clearInput key, did
+  // nothing; tried 2026-11-09). So the newest one goes.
+  cancelQueued(agent, cx) {
+    const list = this.queueFor(agent.address);
+    if (list.length) list[list.length - 1].acting = Date.now();
+    cx.spawn(async () => { await hc(["keys", agent.address, "up"]); await hc(["keys", agent.address, "ctrl+u"]); });
     cx.notify();
   }
 
@@ -1552,9 +1594,12 @@ export default class ClaudeChat extends View {
       .bg(fade(t.accent, "0d")).text_color(t.muted)
       .child(div().child(TextView.markdown(`queued-text-${k}`, plainMarkdown(q.text)).selectable(true)))
       .child(h_flex().mt(6).gap(10).items_center().text_size(px(11.5)).text_color(t.dim)
-        .child(div().flex_1().min_w(0).truncate().child(q.sent ? "Sending now…" : "Queued · Claude takes it when this turn ends"))
-        .when(last && !q.sent, (el) => el.child(this.button(t, `send-now-${k}`, "Send now", (_e, cx) => this.sendNow(agent, cx))
-          .tooltip("Give it to Claude right away, mid-turn (Enter on its empty prompt)"))));
+        .child(div().flex_1().min_w(0).truncate().child(q.acting ? "…" : "Queued · Claude reads it at its next step, or when this turn ends"))
+        .when(last && !q.acting, (el) => el
+          .child(this.button(t, `cancel-queued-${k}`, "Cancel", (_e, cx) => this.cancelQueued(agent, cx))
+            .tooltip("Take it back out of Claude's queue (Up, then clear its prompt)"))
+          .child(this.button(t, `send-now-${k}`, "Send now", (_e, cx) => this.sendNow(agent, cx))
+            .tooltip("Give it to Claude right away (Enter on its empty prompt)"))));
   }
 
   subChips(t) {
