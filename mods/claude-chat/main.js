@@ -206,20 +206,39 @@ function inDocker(where, script, ...args) {
 // The claude args of a `docker exec … claude …` line, for telling execs apart.
 const claudeArgs = (cmd) => (/\sclaude(\s.*)?$/.exec(cmd)?.[1] ?? "").replace(/["']/g, "").replace(/\s+/g, " ").trim();
 
-// The container's Claude. Its ~/.claude can be a volume shared by several containers, each
-// running Claudes with the same low pids, so sessions/<pid>.json is overwritten by whichever
-// wrote last and can't be trusted. Instead, among the container's own `claude` processes
-// started by an exec (parent pid 0) with the same args as this agent's `docker exec … claude …`
-// (`p`), the one that started nearest to when the exec did (normally a second apart; after
-// the computer slept the clocks can disagree by hours, then the nearest is still the best guess).
+// A container Claude's sessions/<pid>.json, if it is really this process's. The folder can be
+// a volume shared by several containers, each running Claudes with the same low pids, so the
+// file can be another container's (its `pidDomain` names the writer's pid namespace) or a dead
+// process's with the same pid (its `procStart` is the writer's /proc/<pid>/stat start ticks).
+// A good one is current: Claude rewrites it on /clear, unlike the tasks file it opened at start.
+function ownSession(file, ns, ticks) {
+  if (!file?.sessionId) return null;
+  if (file.pidDomain && ns && !file.pidDomain.endsWith(ns)) return null;
+  if (file.procStart && ticks && String(file.procStart) !== String(ticks)) return null;
+  return file;
+}
+
+// The container's Claude: among the container's own `claude` processes started by an exec
+// (parent pid 0) with the same args as this agent's `docker exec … claude …` (`p`), the one
+// that started nearest to when the exec did (normally a second apart). The start is the
+// session file's wall-clock `startedAt` when the file is the process's (`ownSession`), else
+// from `ps`'s elapsed time, which drifts by hours after the computer slept (the VM's monotonic
+// clock stops): on 2026-11-07 that picked a Claude 36 min off over the right one, 3 h off.
 async function inContainer(where, p) {
   const args = claudeArgs(p.cmd);
-  const r = await inDocker(where, 'now=$(date +%s); ps -eo pid=,ppid=,etimes=,args= | while read pid ppid et cmd; do [ "$ppid" = 0 ] && case "$cmd" in claude|"claude "*) echo "$pid $((now-et)) $cmd";; esac; done; true');
-  const claudes = r.stdout.split("\n").map((l) => /^(\d+) (\d+) claude(.*)$/.exec(l.trim())).filter(Boolean)
-    .map((m) => ({ pid: Number(m[1]), start: Number(m[2]) * 1000, args: claudeArgs(` claude${m[3]}`) }))
-    .filter((c) => c.args === args)
-    .sort((a, b) => Math.abs(a.start - p.start) - Math.abs(b.start - p.start) || b.pid - a.pid);
-  return claudes.length ? { ...where, pid: claudes[0].pid } : null;
+  const r = await inDocker(where, 'now=$(date +%s); ps -eo pid=,ppid=,etimes=,args= | while read pid ppid et cmd; do [ "$ppid" = 0 ] && case "$cmd" in claude|"claude "*) echo "P $pid $((now-et)) $(awk "{print \\$22}" /proc/$pid/stat 2>/dev/null) $(readlink /proc/$pid/ns/pid 2>/dev/null) $cmd"; echo "F $(cat "$d/sessions/$pid.json" 2>/dev/null | tr -d "\\n")";; esac; done; true');
+  const lines = r.stdout.split("\n");
+  const claudes = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^P (\d+) (\d+) (\d*) (\S*) claude(.*)$/.exec(lines[i].trim());
+    if (!m) continue;
+    let file = null;
+    try { file = lines[i + 1]?.startsWith("F ") ? ownSession(JSON.parse(lines[i + 1].slice(2)), m[4], m[3]) : null; } catch {}
+    claudes.push({ pid: Number(m[1]), start: file?.startedAt ?? Number(m[2]) * 1000, args: claudeArgs(` claude${m[5]}`) });
+  }
+  const best = claudes.filter((c) => c.args === args)
+    .sort((a, b) => Math.abs(a.start - p.start) - Math.abs(b.start - p.start) || b.pid - a.pid)[0];
+  return best ? { ...where, pid: best.pid } : null;
 }
 
 // Where the Claude running in `address` keeps its session: here (~/.claude/sessions/<pid>.json),
@@ -276,22 +295,24 @@ async function transcriptOf(session) {
 }
 
 // The session a Claude is on now ({ sessionId, cwd, … }): here from its sessions/<pid>.json;
-// in a container from the process itself (sessions/<pid>.json there may be another container's,
-// see inContainer): the session id is in the path of its open <tmp>/claude-<uid>/<folder>/
-// <session id>/tasks file, the cwd is /proc/<pid>/cwd. The file is the fallback.
+// in a container from that file when it is the process's own (`ownSession`; it is current:
+// Claude rewrites it on /clear), else from the process itself: the session id is in the path
+// of its open <tmp>/claude-<uid>/<folder>/<session id>/tasks file, the cwd is /proc/<pid>/cwd.
+// That file is the one opened at start, so after a /clear it names the old session (seen
+// 2026-11-07: the chat showed the old transcript and no question card), hence the file first.
 async function sessionOf(where) {
   if (!where.container) {
     const text = await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
     try { return text ? JSON.parse(text) : null; } catch { return null; }
   }
-  const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); if [ -n \"$s\" ] && [ -n \"$c\" ]; then printf '{\"sessionId\":\"%s\",\"cwd\":\"%s\",\"pid\":%s}' \"$s\" \"$c\" \"$p\"; else printf '{\"ns\":\"%s\",\"file\":' \"$n\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"; fi", String(where.pid));
+  const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); k=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); printf '{\"ns\":\"%s\",\"ticks\":\"%s\",\"fd\":\"%s\",\"cwd\":\"%s\",\"file\":' \"$n\" \"$k\" \"$s\" \"$c\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"", String(where.pid));
   let j;
   try { j = JSON.parse(r.stdout); } catch { return null; }
-  if (j?.sessionId) return j;
-  // No tasks file to go by (an older Claude, or a resumed one): the session file, if it is this
-  // container's (its pidDomain names the pid namespace), else nothing rather than another's.
-  const file = j?.file;
-  return file?.sessionId && (!file.pidDomain || !j.ns || file.pidDomain.endsWith(j.ns)) ? file : null;
+  const own = ownSession(j?.file, j?.ns, j?.ticks);
+  if (own) return own;
+  // No file of its own: the session the process started on, if it has the tasks file (a
+  // --resume'd one on 2.1.306 had none), else nothing rather than another container's.
+  return j?.fd && j?.cwd ? { sessionId: j.fd, cwd: j.cwd, pid: where.pid } : null;
 }
 
 // Its transcript; in a container, relative to its Claude folder (read through docker).
