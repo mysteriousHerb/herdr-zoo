@@ -1592,13 +1592,23 @@ export default class ClaudeChat extends View {
   // on an empty prompt it would interrupt the turn. Then the messages to keep are sent again, in
   // order (Enter while Claude works queues them again), the one to deliver first, followed by
   // ctrl+enter (Claude's chat:sendNow: the transcript logs it removed, "absorbed_mid_turn").
-  async requeue(agent, keep, first = null) {
+  async requeue(agent, keep, first, cx) {
     const t = agent.address;
+    const log = [`${new Date().toISOString()} requeue ${t} first=${JSON.stringify(first)} keep=${JSON.stringify(keep)}`];
     await hc(["keys", t, "up"]);
-    const screen = (await hc(["read", t]).catch(() => null))?.stdout ?? "";
-    if (promptText(screen)) await hc(["keys", t, "ctrl+c"]);
+    // The screen lags the key: read right after Up it still showed the empty prompt, so Ctrl+C
+    // was never pressed and the popped messages sat in the prompt (2026-11-09).
+    let held = "";
+    for (let i = 0; i < 4 && !held; i++) {
+      await cx.sleep(300);
+      held = promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+      log.push(`read ${i}: ${JSON.stringify(held.slice(0, 80))}`);
+    }
+    if (held) await hc(["keys", t, "ctrl+c"]);
     if (first) { await hc(["send", t, first]); await hc(["keys", t, "ctrl+enter"]); }
     for (const text of keep) await hc(["send", t, text]);
+    log.push("done");
+    writeFile(`${appHome()}/queue.log`, log.join("\n") + "\n").catch(() => {});
   }
 
   sendNow(agent, q, cx) {
@@ -1607,7 +1617,7 @@ export default class ClaudeChat extends View {
     const others = list.filter((x) => x !== q).map((x) => x.text);
     cx.spawn(async () => {
       if (!others.length) await hc(["keys", agent.address, "ctrl+enter"]);
-      else await this.requeue(agent, others, q.text);
+      else await this.requeue(agent, others, q.text, cx);
     });
     cx.notify();
   }
@@ -1615,7 +1625,7 @@ export default class ClaudeChat extends View {
   cancelQueued(agent, q, cx) {
     const list = this.queueFor(agent.address);
     for (const x of list) x.acting ??= Date.now();
-    cx.spawn(async () => { await this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text)); });
+    cx.spawn(async () => { await this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx); });
     cx.notify();
   }
 
