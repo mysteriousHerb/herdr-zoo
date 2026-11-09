@@ -1550,9 +1550,14 @@ export default class ClaudeChat extends View {
     let d;
     try { d = JSON.parse(line); } catch { return; }
     const text = typeof d.content === "string" ? d.content.trim() : "";
-    if (!text) return;
     const list = this.queueFor(this.address);
     const at = Date.parse(d.timestamp) || Date.now();
+    if (!text) {
+      // A dequeue at the turn's end names no message: Claude took the whole queue as its next
+      // prompt (seen 2026-11-09: the rows stayed, and Cancel on one re-sent a taken message).
+      if (d.operation !== "enqueue" && list.length) { list.length = 0; this.version = (this.version ?? 0) + 1; }
+      return;
+    }
     if (d.operation === "enqueue") {
       // Old lines are read on load too: their enqueues are long taken (or lost).
       if (Date.now() - at > 3600000) return;
