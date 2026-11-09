@@ -294,22 +294,74 @@ async function transcriptOf(session) {
   return null;
 }
 
+// A /resume typed into Claude's own prompt changes its session, but sessions/<pid>.json keeps
+// the one from the last /clear (Claude 2.1.306; seen 2026-11-09: a dev-container agent /clear'd,
+// then /resume'd its old chat and worked there for a day, while the chat showed the "/clear"-only
+// transcript). The file does say when its status last changed (`statusUpdatedAt`): the moment
+// a prompt was taken (working) or a turn ended (idle). The session the agent is on has a line
+// at that moment: for a prompt, in history.jsonl (each prompt with its session id; cheap), and
+// in any case in its transcript (`scan`: the transcripts in that cwd written since, their tails
+// searched for a timestamp within 2 s; one shell call, dev containers only). The pick is kept
+// on `where` (per agent) until the file's session changes, i.e. the next /clear, and each status
+// change is looked at once.
+const HISTORY_TAIL = 65536;
+async function followResume(where, file, history, scan = null) {
+  if (where.fileId !== file.sessionId) Object.assign(where, { fileId: file.sessionId, resumed: null });
+  const at = file.statusUpdatedAt;
+  if (at && at !== where.matchedAt) {
+    where.matchedAt = at;
+    const same = (a, b) => String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase();
+    let ids = new Set();
+    if (file.status === "working") {
+      for (const line of ((await history().catch(() => "")) ?? "").split("\n")) {
+        let e;
+        try { e = JSON.parse(line); } catch { continue; }
+        // A /clear is logged under the session it ended.
+        if (e?.sessionId && e.display !== "/clear" && same(e.project, file.cwd) && Math.abs(e.timestamp - at) <= 3000) ids.add(e.sessionId);
+      }
+    }
+    if (ids.size !== 1 && scan) ids = new Set(await scan(at).catch(() => []));
+    // Nothing at that moment, or two Claudes in this cwd at once: keep what we had.
+    if (ids.size === 1) {
+      const [id] = ids;
+      where.resumed = id === file.sessionId ? null : id;
+    }
+  }
+  return where.resumed ? { ...file, sessionId: where.resumed } : file;
+}
+
+// The sessions in `folder` (a projects/ folder name) with a transcript line stamped within 2 s
+// of `at`, among transcripts written since then (`find -mmin`, so a minute's slack), by their tails.
+async function scanTranscripts(where, folder, at) {
+  const seconds = [-2, -1, 0, 1, 2].map((s) => new Date(at + s * 1000).toISOString().slice(0, 19)).join("|");
+  const mins = String(Math.max(1, Math.ceil((Date.now() - at) / 60000) + 1));
+  const r = await inDocker(where, 'for f in $(find "$d/projects/$2" -maxdepth 1 -name "*.jsonl" -mmin -$3 2>/dev/null); do tail -c 200000 "$f" | grep -qE "\\"timestamp\\":\\"($4)" && basename "$f" .jsonl; done; true', folder, mins, seconds);
+  return r.stdout.split("\n").map((s) => s.trim()).filter((s) => /^[0-9a-f-]{36}$/.test(s));
+}
+
 // The session a Claude is on now ({ sessionId, cwd, … }): here from its sessions/<pid>.json;
 // in a container from that file when it is the process's own (`ownSession`; it is current:
 // Claude rewrites it on /clear), else from the process itself: the session id is in the path
 // of its open <tmp>/claude-<uid>/<folder>/<session id>/tasks file, the cwd is /proc/<pid>/cwd.
 // That file is the one opened at start, so after a /clear it names the old session (seen
 // 2026-11-07: the chat showed the old transcript and no question card), hence the file first.
+// Neither follows a /resume typed into Claude's own prompt (`followResume`).
 async function sessionOf(where) {
   if (!where.container) {
     const text = await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
-    try { return text ? JSON.parse(text) : null; } catch { return null; }
+    let file = null;
+    try { file = text ? JSON.parse(text) : null; } catch { return null; }
+    return file && followResume(where, file, async () => {
+      const bytes = await readFile(`${CLAUDE}/history.jsonl`).catch(() => null);
+      return bytes ? utf8(bytes.subarray(Math.max(0, bytes.length - HISTORY_TAIL))) : "";
+    });
   }
-  const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); k=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); printf '{\"ns\":\"%s\",\"ticks\":\"%s\",\"fd\":\"%s\",\"cwd\":\"%s\",\"file\":' \"$n\" \"$k\" \"$s\" \"$c\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"", String(where.pid));
+  const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); k=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); printf '{\"ns\":\"%s\",\"ticks\":\"%s\",\"fd\":\"%s\",\"cwd\":\"%s\",\"file\":' \"$n\" \"$k\" \"$s\" \"$c\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"; echo --history--; tail -c $3 \"$d/history.jsonl\" 2>/dev/null", String(where.pid), String(HISTORY_TAIL));
+  const [head, history = ""] = r.stdout.split("--history--\n");
   let j;
-  try { j = JSON.parse(r.stdout); } catch { return null; }
+  try { j = JSON.parse(head); } catch { return null; }
   const own = ownSession(j?.file, j?.ns, j?.ticks);
-  if (own) return own;
+  if (own) return followResume(where, own, async () => history, (at) => scanTranscripts(where, folderName(own.cwd), at));
   // No file of its own: the session the process started on, if it has the tasks file (a
   // --resume'd one on 2.1.306 had none), else nothing rather than another container's.
   return j?.fd && j?.cwd ? { sessionId: j.fd, cwd: j.cwd, pid: where.pid } : null;
