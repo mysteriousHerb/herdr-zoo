@@ -956,7 +956,9 @@ export default class ClaudeChat extends View {
   // What tick and watch can change on screen.
   drawn() {
     // A model / effort pick in flight: its timeout redraws too (see settlePick).
-    return `${this.address}|${this.version}|${this.problem}|${this.screen}|${this.pending ? Date.now() > this.pending.until : ""}`;
+    const agent = this.target();
+    const queued = agent ? this.queuedNow(agent).map((q) => `${q.at}:${Boolean(q.sent)}`).join(",") : "";
+    return `${this.address}|${this.version}|${this.problem}|${this.screen}|${this.pending ? Date.now() > this.pending.until : ""}|${queued}`;
   }
 
   async tail(address) {
@@ -1228,6 +1230,9 @@ export default class ClaudeChat extends View {
     const message = [text, ...files.map((f) => `[Image: ${f}]`)].filter(Boolean).join("\n");
     // Pasted images are already in Claude's prompt: Enter alone sends them.
     const idle = this.target()?.status === "idle";
+    // While Claude works, the message waits in its prompt as a queued message: shown in the log
+    // until the transcript has it (queuedNow), with "Send now" (steer).
+    if (message && this.target()?.status === "working") this.queueFor(address).push({ text: message, at: Date.now() });
     cx.spawn(async (cx) => {
       if (idle) await this.leaveMenu(address, cx);
       await hc(message ? ["send", address, message] : ["keys", address, "enter"]);
@@ -1510,6 +1515,48 @@ export default class ClaudeChat extends View {
   }
 
   // The shown agent's sub-agents at work, over the box; click one to open it.
+  // ---- queued messages (sent while Claude works)
+
+  // Claude's terminal keeps a message typed during a turn as a queued message and takes it when
+  // the turn ends (or right away: Enter on its empty prompt, "Send now" here). Until the
+  // transcript shows it, the log shows it dimmed at the bottom. Per agent, kept across switches.
+  queueFor(address) {
+    this.queues ??= new Map();
+    if (!this.queues.has(address)) this.queues.set(address, []);
+    return this.queues.get(address);
+  }
+
+  // The agent's queued messages still waiting: one delivered is in the transcript (its text, on
+  // its own or joined with others), and one Claude no longer holds (removed in the terminal, or
+  // taken by a turn that ended) is gone 5 s after the agent stops working.
+  queuedNow(agent) {
+    const list = this.queues?.get(agent.address);
+    if (!list?.length) return [];
+    const recent = this.items.slice(-40).filter((x) => x.kind === "user").map((x) => x.text);
+    const now = Date.now();
+    const kept = list.filter((q) => !recent.some((u) => u.includes(q.text))
+      && (agent.status === "working" || now - q.at < 5000) && !(q.sent && now - q.sent > 8000));
+    if (kept.length !== list.length) this.queues.set(agent.address, kept);
+    return kept;
+  }
+
+  // Enter on Claude's empty prompt sends its queued messages right away (steering).
+  sendNow(agent, cx) {
+    for (const q of this.queueFor(agent.address)) q.sent ??= Date.now();
+    cx.spawn(async () => { await hc(["keys", agent.address, "enter"]); });
+    cx.notify();
+  }
+
+  queuedRow(t, q, k, agent, last) {
+    return div().id(`queued-${k}`).w_full().px(12).py(8).rounded(8).border(1).border_color(fade(t.accent, "40"))
+      .bg(fade(t.accent, "0d")).text_color(t.muted)
+      .child(div().child(TextView.markdown(`queued-text-${k}`, plainMarkdown(q.text)).selectable(true)))
+      .child(h_flex().mt(6).gap(10).items_center().text_size(px(11.5)).text_color(t.dim)
+        .child(div().flex_1().min_w(0).truncate().child(q.sent ? "Sending now…" : "Queued · Claude takes it when this turn ends"))
+        .when(last && !q.sent, (el) => el.child(this.button(t, `send-now-${k}`, "Send now", (_e, cx) => this.sendNow(agent, cx))
+          .tooltip("Give it to Claude right away, mid-turn (Enter on its empty prompt)"))));
+  }
+
   subChips(t) {
     const list = [...this.subs].filter(([id, s]) => subRunning(s, this.tools.get(id)));
     if (!list.length) return null;
@@ -1958,6 +2005,11 @@ export default class ClaudeChat extends View {
         .child(x.work ? this.turnRow(t, x, found) : this.bubble(t, x[0], x[1]));
     });
     if (this.seek !== null) this.resolveSeek(cx);
+    // Messages sent while Claude works, waiting in its prompt (not in a sub-agent's view).
+    if (!sub) {
+      const queued = this.queuedNow(agent);
+      rows.push(...queued.map((q, k) => this.queuedRow(t, q, k, agent, k === queued.length - 1)));
+    }
     // Built once each: they're shown only when there is one.
     const chips = this.subChips(t);
     const status = this.status(t, agent);

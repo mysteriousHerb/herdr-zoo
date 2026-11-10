@@ -10,7 +10,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { props, run, exec, theme, spaces, terminals, layout, hc, knownAgents, shared, setShared } from "herdr";
+import { props, run, exec, theme, spaces, terminals, panes, focused, layout, hc, knownAgents, shared, setShared } from "herdr";
 
 const LABEL = "zoo.quickterm";
 const KINDS = "quickterm.kind"; // { <space id>: "local" | "dev" }
@@ -33,13 +33,30 @@ function live(address) {
   if (t) return t.state === "live";
   return Date.now() - (made.get(address) ?? 0) < 60000;
 }
-// A dev terminal to replace: one started with an older command (its `zoo.quickterm.v` label isn't
-// DEV_VERSION; bump it when `devArgv` changes), or a lost one (core restart, reboot), which comes
-// back as a plain shell with its labels: PowerShell, not the container's bash (a live one is cmd.exe).
+// A terminal to replace: one started by older code (its `zoo.quickterm.v` label isn't VERSION; bump
+// it when the command or the folder it starts in changes), or a lost dev one (core restart, reboot),
+// which comes back as a plain shell with its labels: PowerShell, not the container's bash (a live
+// one is cmd.exe).
 const VERSION = "zoo.quickterm.v";
-const DEV_VERSION = "2";
-const stale = (t, want) => want.endsWith(":dev") &&
-  (t.labels?.[VERSION] !== DEV_VERSION || /^(powershell|pwsh)/i.test(t.agent ?? ""));
+const NOW = "3";
+const stale = (t, want) => t.labels?.[VERSION] !== NOW ||
+  (want.endsWith(":dev") && /^(powershell|pwsh)/i.test(t.agent ?? ""));
+
+// Where a space's quick terminal starts: where the space's terminals are (the focused one, else the
+// shown tab's, else any tab's). Not `space.folder`: started from it, the harness-agent space's quick
+// terminal opened in plat3_dev2 (2026-11-10; it looks like the folder of whatever terminal had the
+// keyboard when the space was made, its value wasn't read). The terminal keeps that folder for life.
+function folderOf(space) {
+  const f = focused();
+  const quick = f?.terminal && terminals().find((t) => t.address === f.terminal)?.labels?.[LABEL];
+  if (f?.space === space.id && f.cwd && !quick) return f.cwd;
+  const tabs = [...(space.tabs ?? [])].sort((a, b) => Number(Boolean(b.active)) - Number(Boolean(a.active)));
+  for (const tab of tabs) {
+    const pane = panes().find((p) => p.tab === tab.id && p.terminal && p.cwd);
+    if (pane) return pane.cwd;
+  }
+  return space.folder || null;
+}
 const labelledTerm = (want) => terminals().find((t) => t.state === "live" && t.labels?.[LABEL] === want) ?? null;
 
 // The dev container terminal's command: my-new-menu's, from the Claude entry, but `devcontainer up`
@@ -140,10 +157,11 @@ export default class QuickTerm extends View {
     cx.spawn(async (cx) => {
       try {
         const args = ["run", "--bg", "--keep", "--no-parent", "--outlive-parent", "--no-notify", "--json",
-          "--label", `${LABEL}=${want}`];
-        if (space.folder) args.push("--cwd", space.folder);
+          "--label", `${LABEL}=${want}`, "--label", `${VERSION}=${NOW}`];
+        const folder = folderOf(space);
+        if (folder) args.push("--cwd", folder);
         if (space.machine) args.push("--on", space.machine);
-        if (kind === "dev") args.push("--label", `${VERSION}=${DEV_VERSION}`, "--", ...devArgv(this.dev));
+        if (kind === "dev") args.push("--", ...devArgv(this.dev));
         const address = JSON.parse((await hc(args)).stdout).address;
         if (address) { made.set(address, Date.now()); this.started[want] = { address, at: Date.now() }; }
       } catch {}
