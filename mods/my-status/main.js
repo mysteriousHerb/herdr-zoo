@@ -425,9 +425,16 @@ export default class WorkspaceStatus extends View {
       await checkSpecs(boxes).catch(() => {});
       const dirs = {};
       for (const root of new Set(boxes.map((b) => b.root))) dirs[pathKey(root)] = await reposIn(root);
+      // Which local spaces' folders have a dev container spec (for Rebuild with no container up).
+      const specs = {};
+      for (const s of spaces()) {
+        if (s.machine || !s.folder || pathKey(s.folder) in specs) continue;
+        specs[pathKey(s.folder)] = await exists(`${s.folder}/.devcontainer/devcontainer.json`).catch(() => false)
+          || await exists(`${s.folder}/.devcontainer.json`).catch(() => false);
+      }
       this.boxing = false;
-      const changed = JSON.stringify([boxes, dirs]) !== JSON.stringify([this.boxes, this.dirs]);
-      this.boxes = boxes; this.dirs = dirs;
+      const changed = JSON.stringify([boxes, dirs, specs]) !== JSON.stringify([this.boxes, this.dirs, this.specs]);
+      this.boxes = boxes; this.dirs = dirs; this.specs = specs;
       if (changed) { cx.notify(); this.readRepos(cx); }
     });
   }
@@ -461,7 +468,10 @@ export default class WorkspaceStatus extends View {
     if (!this.boxes?.length) return null;
     const map = shared(CONTAINERS) ?? {};
     const box = (tok) => (tok ? this.boxes.find((b) => b.id.startsWith(tok) || b.name === tok) : null);
-    let b = box(f?.agent && map[f.agent]);
+    // focused().agent is the agent last shown, which can be another space's (in a space with
+    // no agent the bar showed the last agent's container, 2026-11-10): only one of this space.
+    const mine = f?.agent && agents().find((a) => a.address === f.agent && (!space || a.space === space.id));
+    let b = box(map[f?.terminal]) ?? box(mine && map[f.agent]);
     if (!b && space) for (const a of agents()) if (a.space === space.id && (b = box(map[a.address]))) break;
     if (!b && folder) b = this.boxes.find((x) => inside(folder, x.local));
     if (!b) return null;
@@ -472,6 +482,8 @@ export default class WorkspaceStatus extends View {
   // Rebuild the dev container: a new tab running `devcontainer up --remove-existing-container`
   // on the folder it was opened from (the + entry's `devcontainer up` reuses the container, so
   // devcontainer.json changes never landed). It asks first: every agent in the container dies.
+  // With no container up (`b.name` unset: it was removed, a rebuild failed, or it is stopped) the
+  // same command builds one; without that the button was gone just when it was needed (2026-11-10).
   rebuild(b, space) {
     const n = b.agents.length;
     const command = { name: "tab.new", args: { name: "Rebuild dev container", space: space?.id, folder: b.local,
@@ -479,7 +491,7 @@ export default class WorkspaceStatus extends View {
     openOverlay({
       mod: "confirm", kind: "dialog", width: 460, height: 170,
       props: { title: "Rebuild the dev container?", command,
-        detail: `${b.name} is removed and started again from ${b.local}.${b.changed?.length ? ` Changed since it was built: ${b.changed.join(", ")}.` : ""}${n ? ` The ${n === 1 ? "agent" : `${n} agents`} running in it ${n === 1 ? "dies" : "die"} with it.` : ""}` },
+        detail: !b.name ? `No dev container is running for ${b.local}. A stopped one is removed, and a fresh one is built and started.` : `${b.name} is removed and started again from ${b.local}.${b.changed?.length ? ` Changed since it was built: ${b.changed.join(", ")}.` : ""}${n ? ` The ${n === 1 ? "agent" : `${n} agents`} running in it ${n === 1 ? "dies" : "die"} with it.` : ""}` },
     });
   }
 
@@ -815,6 +827,10 @@ export default class WorkspaceStatus extends View {
         .tooltip([box.changed?.length ? `The dev container spec changed since ${box.name} was built (${ago(box.created)}): ${box.changed.join(", ")}. Rebuild to apply it.` : null,
           `Rebuild the dev container ${box.name} (from ${box.local}): removes it and starts a fresh one${box.agents.length ? `; ${box.agents.length} agent${box.agents.length === 1 ? "" : "s"} in it would end` : ""}`].filter(Boolean).join("\n"))
         .on_click(() => this.rebuild(box, space))))
+      .when(!box && Boolean(space?.folder) && !space.machine && Boolean(this.specs?.[pathKey(space.folder)]), el => el.child(label("archive", "Rebuild").id("rebuild").cursor_pointer()
+        .hover(s => s.text_color(t.foreground))
+        .tooltip(`No dev container is running for ${space.folder}: build and start one (a stopped one is removed)`)
+        .on_click(() => this.rebuild({ local: space.folder, agents: [] }, space))))
       .when(Boolean(pr), el => el.child(label("git-compare", `PR #${pr.number}`).id("open-pr").cursor_pointer()
         .when(prState === "merged", s => s.text_color(t.ansi5)).when(prState === "closed", s => s.text_color(t.dim))
         .hover(s => s.text_color(t.foreground))
