@@ -127,8 +127,9 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
   "rewind", "skills", "status", "statusline", "tasks", "theme", "tui", "usage", "workflows"]);
 
 // The header's model / effort bar (see pick), as Claude's /model list names them; the alias is
-// how settings.json's "model" names the default. Read off Claude 2.1.318, 2026-11-05.
-const MODELS = [["opus", "Opus 5.5"], ["fable", "Fable 5.1"], ["sonnet", "Sonnet 5.5"], ["haiku", "Haiku 5.5"]];
+// how settings.json's "model" names the default. Read off Claude 2.1.318, 2026-11-05; Fable
+// 5.1 → 5.2 on 2026-11-10 (its release), not read off the list again.
+const MODELS = [["opus", "Opus 5.5"], ["fable", "Fable 5.2"], ["sonnet", "Sonnet 5.5"], ["haiku", "Haiku 5.5"]];
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // "claude-opus-5-5" → "Opus 5.5"; a display name stays as it is.
 const modelLabel = (m) => {
@@ -304,11 +305,17 @@ async function transcriptOf(session) {
 // searched for a timestamp within 2 s; one shell call, dev containers only). The pick is kept
 // on `where` (per agent) until the file's session changes, i.e. the next /clear, and each status
 // change is looked at once.
+// Dev containers share one Claude folder, so the transcripts scanned include the other
+// containers' agents': on 2026-11-10 a Claude just started in one container (no transcript yet)
+// showed the chat of one at work in another, which had a line within 2 s of its start. So a
+// status that hasn't changed since the start is not looked at (nothing was resumed yet), and
+// the sessions the other agents are on (`taken`) never count.
 const HISTORY_TAIL = 65536;
-async function followResume(where, file, history, scan = null) {
+async function followResume(where, file, history, scan = null, taken = null) {
   if (where.fileId !== file.sessionId) Object.assign(where, { fileId: file.sessionId, resumed: null });
   const at = file.statusUpdatedAt;
-  if (at && at !== where.matchedAt) {
+  const fresh = file.status !== "working" && file.startedAt && Math.abs(at - file.startedAt) < 3000;
+  if (at && at !== where.matchedAt && !fresh) {
     where.matchedAt = at;
     const same = (a, b) => String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase();
     let ids = new Set();
@@ -321,6 +328,8 @@ async function followResume(where, file, history, scan = null) {
       }
     }
     if (ids.size !== 1 && scan) ids = new Set(await scan(at).catch(() => []));
+    const theirs = taken?.() ?? new Set();
+    for (const id of [...ids]) if (id !== file.sessionId && theirs.has(id)) ids.delete(id);
     // Nothing at that moment, or two Claudes in this cwd at once: keep what we had.
     if (ids.size === 1) {
       const [id] = ids;
@@ -346,7 +355,7 @@ async function scanTranscripts(where, folder, at) {
 // That file is the one opened at start, so after a /clear it names the old session (seen
 // 2026-11-07: the chat showed the old transcript and no question card), hence the file first.
 // Neither follows a /resume typed into Claude's own prompt (`followResume`).
-async function sessionOf(where) {
+async function sessionOf(where, taken = null) {
   if (!where.container) {
     const text = await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
     let file = null;
@@ -354,14 +363,14 @@ async function sessionOf(where) {
     return file && followResume(where, file, async () => {
       const bytes = await readFile(`${CLAUDE}/history.jsonl`).catch(() => null);
       return bytes ? utf8(bytes.subarray(Math.max(0, bytes.length - HISTORY_TAIL))) : "";
-    });
+    }, null, taken);
   }
   const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); k=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); printf '{\"ns\":\"%s\",\"ticks\":\"%s\",\"fd\":\"%s\",\"cwd\":\"%s\",\"file\":' \"$n\" \"$k\" \"$s\" \"$c\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"; echo --history--; tail -c $3 \"$d/history.jsonl\" 2>/dev/null", String(where.pid), String(HISTORY_TAIL));
   const [head, history = ""] = r.stdout.split("--history--\n");
   let j;
   try { j = JSON.parse(head); } catch { return null; }
   const own = ownSession(j?.file, j?.ns, j?.ticks);
-  if (own) return followResume(where, own, async () => history, (at) => scanTranscripts(where, folderName(own.cwd), at));
+  if (own) return followResume(where, own, async () => history, (at) => scanTranscripts(where, folderName(own.cwd), at), taken);
   // No file of its own: the session the process started on, if it has the tasks file (a
   // --resume'd one on 2.1.306 had none), else nothing rather than another container's.
   return j?.fd && j?.cwd ? { sessionId: j.fd, cwd: j.cwd, pid: where.pid } : null;
@@ -672,6 +681,20 @@ export default class ClaudeChat extends View {
     }
   }
 
+  // The sessions the agents other than `address` are on (and the ones their session files name),
+  // for `followResume`.
+  takenBy(address) {
+    const ids = new Set();
+    const add = (a, where, session) => {
+      if (a === address) return;
+      if (session?.sessionId) ids.add(session.sessionId);
+      if (where?.fileId) ids.add(where.fileId);
+    };
+    for (const [a, kept] of this.cache) if (a !== this.address) add(a, kept.where, kept.session);
+    add(this.address, this.where, this.session);
+    return ids;
+  }
+
   // The other Claude agents' sub-agents (their meta files only), every 6 s, so the count covers
   // every agent. A changed session (/clear) starts what's kept of that agent over.
   async scanOthers() {
@@ -680,7 +703,7 @@ export default class ClaudeChat extends View {
     for (const { address } of agents().filter((a) => a.app === "claude-code" && a.address !== this.address)) {
       const kept = this.cache.get(address);
       if (!kept?.where) continue;
-      const session = await sessionOf(kept.where).catch(() => null);
+      const session = await sessionOf(kept.where, () => this.takenBy(address)).catch(() => null);
       if (!session || address === this.address || this.cache.get(address) !== kept) continue;
       if (session.sessionId !== kept.session?.sessionId || !kept.file) {
         const file = await fileOf(kept.where, session);
@@ -933,7 +956,7 @@ export default class ClaudeChat extends View {
         }
         const where = this.where;
         if (where && this.address === address) {
-          const session = await sessionOf(where);
+          const session = await sessionOf(where, () => this.takenBy(address));
           if (this.address !== address) return;
           if (!session) { this.where = null; this.looked = 0; }
           else if (session.sessionId !== this.session?.sessionId || !this.file) {
