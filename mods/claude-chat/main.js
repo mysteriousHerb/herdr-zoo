@@ -517,6 +517,33 @@ function markMarkdown(md, re, color) {
     return head + markInline(rest, mark, test, color);
   }).join("\n");
 }
+// Claude's markdown cut at its code blocks, so each can have a copy button (TextView draws a
+// whole message and has no hook per block): [{ md }] or [{ md, code }], `code` = the block's
+// body. Same fence rule as markMarkdown, but only fences at the line's start: one inside a list
+// or quote stays in its text (cut out, the list would lose its numbering and indent). An
+// unclosed fence runs to the end. Null when there is no block; kept on the item.
+function codeParts(item) {
+  if (item.parts !== undefined) return item.parts;
+  item.parts = null;
+  if (!/^(`{3,}|~{3,})/m.test(item.text)) return null;
+  const parts = [];
+  let text = [], block = null, fence = null;
+  const flush = () => { if (text.join("").trim()) parts.push({ md: text.join("\n") }); text = []; };
+  for (const l of item.text.split("\n")) {
+    const f = /^(`{3,}|~{3,})/.exec(l);
+    if (fence) {
+      block.push(l);
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !l.slice(f[1].length).trim()) {
+        parts.push({ md: block.join("\n"), code: block.slice(1, -1).join("\n") });
+        fence = null;
+      }
+    } else if (f) { flush(); fence = f[1]; block = [l]; }
+    else text.push(l);
+  }
+  if (fence) parts.push({ md: block.join("\n"), code: block.slice(1).join("\n") });
+  else flush();
+  return (item.parts = parts);
+}
 // Your message (see plainMarkdown) with the hits marked.
 const plainMarked = (s, re, color) => s.replace(/\r/g, "").split(/\n\s*\n/)
   .map((p) => p.split("\n").map(marker(re, color, plainEscape)).join("\\\n")).join("\n\n");
@@ -1454,11 +1481,31 @@ export default class ClaudeChat extends View {
             .child(svg("mods/workspace-chrome/git-branch.svg").size(13)))));
     }
     if (item.kind === "claude") {
+      const marked = (md) => this.markIn(i) ? markMarkdown(md, this.marks.re, this.markIn(i)) : md;
+      const parts = codeParts(item);
       return h_flex().w_full().gap(8).items_start()
         .on_mouse_down("right", (e) => this.ctxHit(e, item))
         .child(div().mt(4).size(8).flex_none().rounded(4).bg(t.accent))
-        .child(div().flex_1().min_w(0).text_color(t.foreground).child(TextView.markdown(`md-${i}`,
-          this.markIn(i) ? markMarkdown(item.text, this.marks.re, this.markIn(i)) : item.text).selectable(true)));
+        .when(!parts, (el) => el.child(div().flex_1().min_w(0).text_color(t.foreground)
+          .child(TextView.markdown(`md-${i}`, marked(item.text)).selectable(true))))
+        // With code blocks: a TextView per piece, each block with its copy button on top.
+        .when(Boolean(parts), (el) => el.child(v_flex().flex_1().min_w(0).gap(8).text_color(t.foreground)
+          .children(parts.map((p, k) => {
+            const view = TextView.markdown(`md-${i}-${k}`, p.code === undefined ? marked(p.md) : p.md).selectable(true);
+            if (p.code === undefined) return div().w_full().child(view);
+            const id = `copy-${i}-${k}`, done = this.copied === id;
+            return div().relative().w_full().child(view)
+              .child(div().id(id).absolute().top(4).right(4).p(4).rounded(4).bg(t.surface)
+                .text_color(done ? t.accent : t.dim).cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(done ? "Copied" : "Copy code")
+                .on_click((_e, cx) => {
+                  cx.write_to_clipboard(p.code);
+                  this.copied = id; cx.notify();
+                  cx.spawn(async (cx) => { await cx.sleep(1500); if (this.copied === id) { this.copied = null; cx.notify(); } });
+                })
+                .child(svg(`mods/workspace-chrome/${done ? "check" : "files"}.svg`).size(12)));
+          }))));
     }
     if (item.kind === "note") {
       return div().w_full().px(10).py(4).text_size(px(12)).text_color(t.dim)
