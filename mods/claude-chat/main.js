@@ -389,6 +389,8 @@ const fileOf = (where, session) => (where.container ? `projects/${folderName(ses
 
 // Plain text as markdown that shows it as typed: punctuation escaped, every line break kept.
 const plainEscape = (s) => s.replace(/[\\`*_{}[\]()<>#+\-.!|~&]/g, "\\$&");
+// Claude's empty prompt while it holds queued messages.
+const QUEUE_HINT = /^Press up to edit queued messages\s*$/;
 // What Claude's prompt holds, read off its screen: the lines between the last two rules, after "❯ ".
 function promptText(screen) {
   const lines = screen.split("\n");
@@ -1189,6 +1191,13 @@ export default class ClaudeChat extends View {
       if (d.isSidechain && into === this) continue;
       if (d.type === "system" && d.subtype === "compact_boundary") into.items.push({ kind: "note", text: "Conversation compacted" });
       if (d.type === "attachment" && d.attachment?.type === "skill_listing" && into === this) this.learnSkills(d.attachment.content);
+      // A message sent during a turn, as Claude took it at its next step (2.1.323: an attachment
+      // line; before, a reminder in a user line, see said).
+      if (d.type === "attachment" && d.attachment?.type === "queued_command" && typeof d.attachment.prompt === "string") {
+        const text = d.attachment.prompt.trim();
+        if (text && !into.items.slice(-6).some((x) => x.mid && x.text === text)) into.items.push({ kind: "user", text, mid: true });
+        continue;
+      }
       if (d.isMeta || d.isCompactSummary) continue;
       const content = d.message?.content;
       if (d.type === "user") {
@@ -1665,6 +1674,16 @@ export default class ClaudeChat extends View {
     const text = typeof d.content === "string" ? d.content.trim() : "";
     const list = this.queueFor(this.address);
     const at = Date.parse(d.timestamp) || Date.now();
+    // A background task's notice goes through the same queue (enqueue, then a dequeue with no
+    // text, mid-turn): not a message of yours, and its dequeue isn't the turn taking the queue.
+    this.queueNotes ??= new Map();
+    const notes = this.queueNotes.get(this.address) ?? 0;
+    if (text.startsWith("<task-notification>")) {
+      if (d.operation === "enqueue" && Date.now() - at < 3600000) this.queueNotes.set(this.address, notes + 1);
+      else if (notes) this.queueNotes.set(this.address, notes - 1);
+      return;
+    }
+    if (!text && d.operation !== "enqueue" && notes) return void this.queueNotes.set(this.address, notes - 1);
     if (!text) {
       // A dequeue at the turn's end names no message: Claude took the whole queue as its next
       // prompt (seen 2026-11-09: the rows stayed, and Cancel on one re-sent a taken message).
@@ -1699,47 +1718,99 @@ export default class ClaudeChat extends View {
   }
 
   // Up in Claude's empty prompt takes every queued message back into the prompt (one popAll line
-  // each, joined by line breaks), and one ctrl+c empties the prompt whatever its length (ctrl+u
-  // only clears one line, and the first line not at all; ctrl+l, Claude's clearInput key, and Esc
-  // did nothing; all tried 2026-11-09). ctrl+c is pressed only when the prompt really holds text:
-  // on an empty prompt it would interrupt the turn. Then the messages to keep are sent again, in
-  // order (Enter while Claude works queues them again), the one to deliver first, followed by
-  // ctrl+enter (Claude's chat:sendNow: the transcript logs it removed, "absorbed_mid_turn").
+  // each, joined by line breaks). The prompt is then emptied a line at a time, ctrl+u (clears
+  // the cursor's line; the cursor is at the end) then backspace (joins the line above), until
+  // the screen shows it empty. Not ctrl+c: on 2.1.318 it emptied a filled prompt, on 2.1.323 it
+  // interrupts the turn and leaves the text (2026-11-13; ctrl+l and Esc did nothing on 2.1.318).
+  // Then the messages to keep are sent again, in order (Enter while Claude works queues them
+  // again), the one to deliver first, followed by ctrl+enter (Claude's chat:sendNow: the
+  // transcript logs it removed, "absorbed_mid_turn"). Only what Up really brought back is sent
+  // again. It starts only while the prompt says "Press up to edit queued messages": without a
+  // queue (the turn just took it) Up browses history instead, and the last entry is the very
+  // message Claude just took. Returns why nothing was done, or null.
   async requeue(agent, keep, first, cx) {
     const t = agent.address;
     const log = [`${new Date().toISOString()} requeue ${t} first=${JSON.stringify(first)} keep=${JSON.stringify(keep)}`];
+    const done = (why) => {
+      log.push(why ?? "done");
+      writeFile(`${appHome()}/queue.log`, log.join("\n") + "\n").catch(() => {});
+      return why;
+    };
+    const prompt = async () => promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+    const before = await prompt();
+    log.push(`before: ${JSON.stringify(before.slice(0, 80))}`);
+    if (!QUEUE_HINT.test(before)) return done("Claude's terminal no longer shows queued messages: nothing changed.");
     await hc(["keys", t, "up"]);
-    // The screen lags the key: read right after Up it still showed the empty prompt, so Ctrl+C
-    // was never pressed and the popped messages sat in the prompt (2026-11-09).
-    let held = "";
-    for (let i = 0; i < 4 && !held; i++) {
+    // The screen lags the key: read right after Up it still showed the hint (2026-11-09).
+    let held = before;
+    for (let i = 0; i < 5 && QUEUE_HINT.test(held); i++) {
       await cx.sleep(300);
-      held = promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+      held = await prompt();
       log.push(`read ${i}: ${JSON.stringify(held.slice(0, 80))}`);
     }
-    if (held) await hc(["keys", t, "ctrl+c"]);
-    if (first) { await hc(["send", t, first]); await hc(["keys", t, "ctrl+enter"]); }
-    for (const text of keep) await hc(["send", t, text]);
-    log.push("done");
-    writeFile(`${appHome()}/queue.log`, log.join("\n") + "\n").catch(() => {});
+    if (QUEUE_HINT.test(held)) return done("Claude's terminal didn't give its queued messages back: nothing changed.");
+    let left = held;
+    for (let i = 0; i < 6 && left; i++) {
+      const lines = left.split("\n").length + 1;
+      await hc(["keys", t, ...Array.from({ length: lines }, () => ["ctrl+u", "backspace"]).flat()]);
+      await cx.sleep(300);
+      left = await prompt();
+      log.push(`cleared ${i}: ${JSON.stringify(left.slice(0, 80))}`);
+    }
+    if (left) return done("Couldn't empty Claude's prompt: the queued messages are in it, in its terminal.");
+    // The screen wraps long lines, so compare without spaces.
+    const squash = (x) => x.replace(/\s+/g, "");
+    const got = squash(held);
+    const lost = [];
+    const send = async (text) => {
+      if (!got.includes(squash(text))) return log.push(`not popped: ${JSON.stringify(text.slice(0, 80))}`);
+      const r = await hc(["send", t, text]).catch((e) => ({ code: 1, stderr: String(e) }));
+      if (r.code) { lost.push(text); log.push(`send failed: ${(r.stderr || "").trim().slice(0, 200)}`); }
+      return !r.code;
+    };
+    if (first && (await send(first)) === true) {
+      await hc(["keys", t, "ctrl+enter"]);
+      // Claude delivers a moment later (1.4 s seen: it moves a running command to the background
+      // first), and takes everything queued by then: the others wait until the hint is gone.
+      for (let i = 0; i < 20; i++) {
+        await cx.sleep(300);
+        if (!QUEUE_HINT.test(await prompt())) break;
+        if (i === 19) log.push("still queued 6 s after ctrl+enter");
+      }
+    }
+    for (const text of keep) await send(text);
+    if (lost.length) {
+      // Claude stopped taking messages (a permission prompt): back into the box, not lost.
+      if (this.address === t && !this.box.value()) { this.box.set_value(lost.join("\n\n")); this.typed = this.box.value(); }
+      return done("Claude stopped taking messages (is it asking something?): the ones not sent again are in the box.");
+    }
+    return done(null);
   }
 
-  sendNow(agent, q, cx) {
+  // A row's button: every row shows "…" while the keys run; a refusal brings the buttons back.
+  actOnQueue(agent, cx, work) {
     const list = this.queueFor(agent.address);
     for (const x of list) x.acting ??= Date.now();
-    const others = list.filter((x) => x !== q).map((x) => x.text);
-    cx.spawn(async () => {
-      if (!others.length) await hc(["keys", agent.address, "ctrl+enter"]);
-      else await this.requeue(agent, others, q.text, cx);
+    cx.spawn(async (cx) => {
+      const why = await work(list).catch((e) => String(e?.message ?? e));
+      if (!why) return;
+      for (const x of this.queueFor(agent.address)) delete x.acting;
+      this.note(why, cx);
     });
     cx.notify();
   }
 
+  sendNow(agent, q, cx) {
+    this.actOnQueue(agent, cx, async (list) => {
+      const others = list.filter((x) => x !== q).map((x) => x.text);
+      if (others.length) return this.requeue(agent, others, q.text, cx);
+      await hc(["keys", agent.address, "ctrl+enter"]);
+      return null;
+    });
+  }
+
   cancelQueued(agent, q, cx) {
-    const list = this.queueFor(agent.address);
-    for (const x of list) x.acting ??= Date.now();
-    cx.spawn(async () => { await this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx); });
-    cx.notify();
+    this.actOnQueue(agent, cx, (list) => this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx));
   }
 
   queuedRow(t, q, k, agent) {
