@@ -313,11 +313,17 @@ async function transcriptOf(session) {
 // searched for a timestamp within 2 s; one shell call, dev containers only). The pick is kept
 // on `where` (per agent) until the file's session changes, i.e. the next /clear, and each status
 // change is looked at once.
+// Dev containers share one Claude folder, so the transcripts scanned include the other
+// containers' agents': on 2026-11-10 a Claude just started in one container (no transcript yet)
+// showed the chat of one at work in another, which had a line within 2 s of its start. So a
+// status that hasn't changed since the start is not looked at (nothing was resumed yet), and
+// the sessions the other agents are on (`taken`) never count.
 const HISTORY_TAIL = 65536;
-async function followResume(where, file, history, scan = null) {
+async function followResume(where, file, history, scan = null, taken = null) {
   if (where.fileId !== file.sessionId) Object.assign(where, { fileId: file.sessionId, resumed: null });
   const at = file.statusUpdatedAt;
-  if (at && at !== where.matchedAt) {
+  const fresh = file.status !== "working" && file.startedAt && Math.abs(at - file.startedAt) < 3000;
+  if (at && at !== where.matchedAt && !fresh) {
     where.matchedAt = at;
     const same = (a, b) => String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase();
     let ids = new Set();
@@ -330,6 +336,8 @@ async function followResume(where, file, history, scan = null) {
       }
     }
     if (ids.size !== 1 && scan) ids = new Set(await scan(at).catch(() => []));
+    const theirs = taken?.() ?? new Set();
+    for (const id of [...ids]) if (id !== file.sessionId && theirs.has(id)) ids.delete(id);
     // Nothing at that moment, or two Claudes in this cwd at once: keep what we had.
     if (ids.size === 1) {
       const [id] = ids;
@@ -355,7 +363,7 @@ async function scanTranscripts(where, folder, at) {
 // That file is the one opened at start, so after a /clear it names the old session (seen
 // 2026-11-07: the chat showed the old transcript and no question card), hence the file first.
 // Neither follows a /resume typed into Claude's own prompt (`followResume`).
-async function sessionOf(where) {
+async function sessionOf(where, taken = null) {
   if (!where.container) {
     const text = await readFile(`${CLAUDE}/sessions/${where.pid}.json`, "utf8").catch(() => null);
     let file = null;
@@ -363,14 +371,14 @@ async function sessionOf(where) {
     return file && followResume(where, file, async () => {
       const bytes = await readFile(`${CLAUDE}/history.jsonl`).catch(() => null);
       return bytes ? utf8(bytes.subarray(Math.max(0, bytes.length - HISTORY_TAIL))) : "";
-    });
+    }, null, taken);
   }
   const r = await inDocker(where, "p=$2; n=$(readlink /proc/$p/ns/pid 2>/dev/null); k=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); s=$(for f in /proc/$p/fd/*; do readlink \"$f\"; done 2>/dev/null | sed -n \"s#^/tmp/claude-[0-9]*/[^/]*/\\([0-9a-f-]\\{36\\}\\)/.*#\\1#p\" | head -n 1); c=$(readlink /proc/$p/cwd 2>/dev/null); printf '{\"ns\":\"%s\",\"ticks\":\"%s\",\"fd\":\"%s\",\"cwd\":\"%s\",\"file\":' \"$n\" \"$k\" \"$s\" \"$c\"; cat \"$d/sessions/$p.json\" 2>/dev/null || echo null; echo \"}\"; echo --history--; tail -c $3 \"$d/history.jsonl\" 2>/dev/null", String(where.pid), String(HISTORY_TAIL));
   const [head, history = ""] = r.stdout.split("--history--\n");
   let j;
   try { j = JSON.parse(head); } catch { return null; }
   const own = ownSession(j?.file, j?.ns, j?.ticks);
-  if (own) return followResume(where, own, async () => history, (at) => scanTranscripts(where, folderName(own.cwd), at));
+  if (own) return followResume(where, own, async () => history, (at) => scanTranscripts(where, folderName(own.cwd), at), taken);
   // No file of its own: the session the process started on, if it has the tasks file (a
   // --resume'd one on 2.1.306 had none), else nothing rather than another container's.
   return j?.fd && j?.cwd ? { sessionId: j.fd, cwd: j.cwd, pid: where.pid } : null;
@@ -381,6 +389,18 @@ const fileOf = (where, session) => (where.container ? `projects/${folderName(ses
 
 // Plain text as markdown that shows it as typed: punctuation escaped, every line break kept.
 const plainEscape = (s) => s.replace(/[\\`*_{}[\]()<>#+\-.!|~&]/g, "\\$&");
+// Claude's empty prompt while it holds queued messages (a narrow terminal wraps it).
+const QUEUE_HINT = { test: (s) => s.replace(/[^a-z]/gi, "") === "Pressuptoeditqueuedmessages" };
+// What Claude's prompt holds, read off its screen: the lines between the last two rules, after "❯ ".
+function promptText(screen) {
+  const lines = screen.split("\n");
+  const rules = [];
+  lines.forEach((l, i) => { if (/^\s*─{20,}\s*$/.test(l)) rules.push(i); });
+  if (rules.length < 2) return "";
+  const [a, b] = rules.slice(-2);
+  return lines.slice(a + 1, b).map((l) => l.replace(/^\s*❯?\s?/, "")).join("\n").trim();
+}
+
 const plainMarkdown = (s) => s.replace(/\r/g, "").split(/\n\s*\n/)
   .map((p) => plainEscape(p).replace(/\n/g, "\\\n")).join("\n\n");
 // A random v4 UUID, for a forked session's id.
@@ -698,6 +718,20 @@ export default class ClaudeChat extends View {
     }
   }
 
+  // The sessions the agents other than `address` are on (and the ones their session files name),
+  // for `followResume`.
+  takenBy(address) {
+    const ids = new Set();
+    const add = (a, where, session) => {
+      if (a === address) return;
+      if (session?.sessionId) ids.add(session.sessionId);
+      if (where?.fileId) ids.add(where.fileId);
+    };
+    for (const [a, kept] of this.cache) if (a !== this.address) add(a, kept.where, kept.session);
+    add(this.address, this.where, this.session);
+    return ids;
+  }
+
   // The other Claude agents' sub-agents (their meta files only), every 6 s, so the count covers
   // every agent. A changed session (/clear) starts what's kept of that agent over.
   async scanOthers() {
@@ -706,7 +740,7 @@ export default class ClaudeChat extends View {
     for (const { address } of agents().filter((a) => a.app === "claude-code" && a.address !== this.address)) {
       const kept = this.cache.get(address);
       if (!kept?.where) continue;
-      const session = await sessionOf(kept.where).catch(() => null);
+      const session = await sessionOf(kept.where, () => this.takenBy(address)).catch(() => null);
       if (!session || address === this.address || this.cache.get(address) !== kept) continue;
       if (session.sessionId !== kept.session?.sessionId || !kept.file) {
         const file = await fileOf(kept.where, session);
@@ -965,7 +999,7 @@ export default class ClaudeChat extends View {
         }
         const where = this.where;
         if (where && this.address === address) {
-          const session = await sessionOf(where);
+          const session = await sessionOf(where, () => this.takenBy(address));
           if (this.address !== address) return;
           if (!session) { this.where = null; this.looked = 0; }
           else if (session.sessionId !== this.session?.sessionId || !this.file) {
@@ -1000,7 +1034,7 @@ export default class ClaudeChat extends View {
   drawn() {
     // A model / effort pick in flight: its timeout redraws too (see settlePick).
     const agent = this.target();
-    const queued = agent ? this.queuedNow(agent).map((q) => `${q.at}:${Boolean(q.sent)}`).join(",") : "";
+    const queued = agent ? this.queuedNow(agent).map((q) => `${q.at}:${Boolean(q.acting)}`).join(",") : "";
     return `${this.address}|${this.version}|${this.problem}|${this.screen}|${this.pending ? Date.now() > this.pending.until : ""}|${queued}`;
   }
 
@@ -1147,6 +1181,8 @@ export default class ClaudeChat extends View {
   // `into`: this chat, or a sub-agent (whose lines are all "sidechain" ones).
   ingest(chunk, into = this) {
     for (const line of chunk.split("\n")) {
+      // Claude's queue of messages sent during a turn (see queueOp).
+      if (into === this && line.startsWith('{"type":"queue-operation"')) { this.queueOp(line); continue; }
       // The conversation's lines; the rest (api requests, snapshots, modes) start with "type".
       if (!line.startsWith('{"parentUuid"')) continue;
       this.version = (this.version ?? 0) + 1;
@@ -1155,6 +1191,14 @@ export default class ClaudeChat extends View {
       if (d.isSidechain && into === this) continue;
       if (d.type === "system" && d.subtype === "compact_boundary") into.items.push({ kind: "note", text: "Conversation compacted" });
       if (d.type === "attachment" && d.attachment?.type === "skill_listing" && into === this) this.learnSkills(d.attachment.content);
+      // A message sent during a turn, as Claude took it at its next step (2.1.323: an attachment
+      // line; before, a reminder in a user line, see said).
+      if (d.type === "attachment" && d.attachment?.type === "queued_command" && typeof d.attachment.prompt === "string"
+        && (d.attachment.origin?.kind ?? "human") === "human") {
+        const text = d.attachment.prompt.trim();
+        if (text && !into.items.slice(-6).some((x) => x.mid && x.text === text)) into.items.push({ kind: "user", text, mid: true });
+        continue;
+      }
       if (d.isMeta || d.isCompactSummary) continue;
       const content = d.message?.content;
       if (d.type === "user") {
@@ -1195,6 +1239,9 @@ export default class ClaudeChat extends View {
 
   // What the person typed, or what Claude Code put in their turn (slash commands, ! commands).
   said(raw, into = this, before = undefined) {
+    // A message sent during a turn reaches Claude inside a reminder, at its next step.
+    const mid = /<system-reminder>\s*The user sent a new message while you were working:\n([\s\S]*?)\n\nThis is how Claude Code surfaces/.exec(raw);
+    if (mid) return into.items.push({ kind: "user", text: mid[1].trim(), mid: true, before });
     const text = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
     if (!text || text.startsWith("<local-command-caveat>")) return;
     const command = tag(text, "command-name");
@@ -1474,6 +1521,8 @@ export default class ClaudeChat extends View {
         .child(h_flex().w_full().gap(8).items_center()
           .child(div().flex_1().min_w(0).child(TextView.markdown(`me-${i}`,
             this.markIn(i) ? plainMarked(item.text, this.marks.re, this.markIn(i)) : plainMarkdown(item.text)).selectable(true)))
+          // Sent while Claude worked: it read this at its next step, not as a turn of its own.
+          .when(Boolean(item.mid), (el) => el.child(div().flex_none().text_size(px(11)).text_color(t.dim).tooltip("Sent while Claude was working; it read it at its next step").child("mid-turn")))
           .when(Boolean(item.before && this.agentNow), (el) => el.child(div().id(`fork-${i}`).flex_none().p(2).rounded(4)
             .text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .tooltip("Fork from here: a copy of the conversation up to just before this message, in a new tab")
@@ -1608,44 +1657,184 @@ export default class ClaudeChat extends View {
   // The shown agent's sub-agents at work, over the box; click one to open it.
   // ---- queued messages (sent while Claude works)
 
-  // Claude's terminal keeps a message typed during a turn as a queued message and takes it when
-  // the turn ends (or right away: Enter on its empty prompt, "Send now" here). Until the
-  // transcript shows it, the log shows it dimmed at the bottom. Per agent, kept across switches.
+  // A message sent while Claude works (Enter, here or in its terminal) goes into Claude's queue
+  // and reaches it at its next step, inside a reminder (`mid` messages in said; "absorbed" in
+  // the transcript), or when the turn ends (ctrl+x enter queues it until then). Claude logs the
+  // queue in the transcript as queue-operation lines (enqueue; dequeue / remove when taken), so
+  // those drive the list (queueOp); a send from here is listed at once and matched to its
+  // enqueue. Shown dimmed at the bottom of the log. Per agent, kept across switches.
   queueFor(address) {
     this.queues ??= new Map();
     if (!this.queues.has(address)) this.queues.set(address, []);
     return this.queues.get(address);
   }
 
-  // The agent's queued messages still waiting: one delivered is in the transcript (its text, on
-  // its own or joined with others), and one Claude no longer holds (removed in the terminal, or
-  // taken by a turn that ended) is gone 5 s after the agent stops working.
+  queueOp(line) {
+    let d;
+    try { d = JSON.parse(line); } catch { return; }
+    const text = typeof d.content === "string" ? d.content.trim() : "";
+    const list = this.queueFor(this.address);
+    const at = Date.parse(d.timestamp) || Date.now();
+    // A background task's notice goes through the same queue (enqueue, then a dequeue with no
+    // text, mid-turn): not a message of yours, and its dequeue isn't the turn taking the queue.
+    this.queueNotes ??= new Map();
+    const notes = this.queueNotes.get(this.address) ?? 0;
+    if (text.startsWith("<task-notification>")) {
+      if (d.operation === "enqueue" && Date.now() - at < 3600000) this.queueNotes.set(this.address, notes + 1);
+      else if (notes) this.queueNotes.set(this.address, notes - 1);
+      return;
+    }
+    if (!text && d.operation !== "enqueue" && notes) return void this.queueNotes.set(this.address, notes - 1);
+    if (!text) {
+      // A dequeue at the turn's end names no message: Claude took the whole queue as its next
+      // prompt (seen 2026-11-09: the rows stayed, and Cancel on one re-sent a taken message).
+      if (d.operation !== "enqueue" && list.length) { list.length = 0; this.version = (this.version ?? 0) + 1; }
+      return;
+    }
+    if (d.operation === "enqueue") {
+      // Old lines are read on load too: their enqueues are long taken (or lost).
+      if (Date.now() - at > 3600000) return;
+      const mine = list.find((q) => q.text === text && !q.logged);
+      if (mine) Object.assign(mine, { logged: true, at });
+      else list.push({ text, at, logged: true });
+    } else {
+      const i = list.findIndex((q) => q.text === text);
+      if (i >= 0) list.splice(i, 1);
+    }
+    this.version = (this.version ?? 0) + 1;
+  }
+
+  // The agent's queued messages still waiting: one the transcript shows delivered (its text, on
+  // its own or joined with others) is gone, and so is any left when the agent stopped working
+  // for 5 s (edited away in the terminal; a remove line should have come).
   queuedNow(agent) {
     const list = this.queues?.get(agent.address);
     if (!list?.length) return [];
     const recent = this.items.slice(-40).filter((x) => x.kind === "user").map((x) => x.text);
     const now = Date.now();
-    const kept = list.filter((q) => !recent.some((u) => u.includes(q.text))
-      && (agent.status === "working" || now - q.at < 5000) && !(q.sent && now - q.sent > 8000));
+    // Only for one Claude's log hasn't named yet: a logged one goes by its remove / dequeue line
+    // (a queued "cancel" was hidden because an earlier message held the word, and a Cancel on
+    // the row beside it then dropped both; 2026-11-13).
+    const kept = list.filter((q) => !(!q.logged && recent.some((u) => u.includes(q.text)))
+      && (agent.status === "working" || now - q.at < 5000) && !(q.acting && now - q.acting > 8000));
     if (kept.length !== list.length) this.queues.set(agent.address, kept);
     return kept;
   }
 
-  // Enter on Claude's empty prompt sends its queued messages right away (steering).
-  sendNow(agent, cx) {
-    for (const q of this.queueFor(agent.address)) q.sent ??= Date.now();
-    cx.spawn(async () => { await hc(["keys", agent.address, "enter"]); });
+  // Up in Claude's empty prompt takes every queued message back into the prompt (one popAll line
+  // each, joined by line breaks). The prompt is then emptied a line at a time, ctrl+u (clears
+  // the cursor's line; the cursor is at the end) then backspace (joins the line above), until
+  // the screen shows it empty. Not ctrl+c: on 2.1.318 it emptied a filled prompt, on 2.1.323 it
+  // interrupts the turn and leaves the text (2026-11-13; ctrl+l and Esc did nothing on 2.1.318).
+  // Then the messages to keep are sent again, in order (Enter while Claude works queues them
+  // again), the one to deliver first, followed by ctrl+enter (Claude's chat:sendNow: the
+  // transcript logs it removed, "absorbed_mid_turn"). Only what Up really brought back is sent
+  // again. It starts only while the prompt says "Press up to edit queued messages": without a
+  // queue (the turn just took it) Up browses history instead, and the last entry is the very
+  // message Claude just took. Returns why nothing was done, or null.
+  async requeue(agent, keep, first, cx) {
+    const t = agent.address;
+    const log = [`${new Date().toISOString()} requeue ${t} first=${JSON.stringify(first)} keep=${JSON.stringify(keep)}`];
+    const done = (why) => {
+      log.push(why ?? "done");
+      writeFile(`${appHome()}/queue.log`, log.join("\n") + "\n").catch(() => {});
+      return why;
+    };
+    const prompt = async () => promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+    const before = await prompt();
+    log.push(`before: ${JSON.stringify(before.slice(0, 80))}`);
+    if (!QUEUE_HINT.test(before)) return done("Claude's terminal no longer shows queued messages: nothing changed.");
+    await hc(["keys", t, "up"]);
+    // The screen lags the key: read right after Up it still showed the hint (2026-11-09).
+    let held = before;
+    for (let i = 0; i < 5 && QUEUE_HINT.test(held); i++) {
+      await cx.sleep(300);
+      held = await prompt();
+      log.push(`read ${i}: ${JSON.stringify(held.slice(0, 80))}`);
+    }
+    if (QUEUE_HINT.test(held)) return done("Claude's terminal didn't give its queued messages back: nothing changed.");
+    let left = held;
+    for (let i = 0; i < 6 && left; i++) {
+      const lines = left.split("\n").length + 1;
+      await hc(["keys", t, ...Array.from({ length: lines }, () => ["ctrl+u", "backspace"]).flat()]);
+      await cx.sleep(300);
+      left = await prompt();
+      log.push(`cleared ${i}: ${JSON.stringify(left.slice(0, 80))}`);
+    }
+    if (left) return done("Couldn't empty Claude's prompt: the queued messages are in it, in its terminal.");
+    // The screen wraps long lines, so compare without spaces.
+    const squash = (x) => x.replace(/\s+/g, "");
+    const got = squash(held);
+    // Claude folds a long paste to "[Pasted text #1 +19 lines]": the texts can't be checked
+    // then, and Up took the whole queue (the hint was there), so all are sent again.
+    const folded = /\[Pasted text #\d+/.test(held);
+    const lost = [];
+    const send = async (text) => {
+      // Not on the screen: not sent blind, kept for the box.
+      if (!folded && !got.includes(squash(text))) { lost.push(text); return log.push(`not popped: ${JSON.stringify(text.slice(0, 80))}`); }
+      const r = await hc(["send", t, text]).catch((e) => ({ code: 1, stderr: String(e) }));
+      if (r.code) { lost.push(text); log.push(`send failed: ${(r.stderr || "").trim().slice(0, 200)}`); }
+      return !r.code;
+    };
+    if (first && (await send(first)) === true) {
+      await hc(["keys", t, "ctrl+enter"]);
+      // Claude delivers a moment later (1.4 s seen: it moves a running command to the background
+      // first), and takes everything queued by then: the others wait until the hint is gone.
+      for (let i = 0; i < 20; i++) {
+        await cx.sleep(300);
+        if (!QUEUE_HINT.test(await prompt())) break;
+        if (i === 19) log.push("still queued 6 s after ctrl+enter");
+      }
+    }
+    for (const text of keep) await send(text);
+    if (lost.length) {
+      // Not seen in the prompt, or Claude stopped taking messages (a permission prompt): back
+      // into the box, not lost.
+      if (this.address === t && !this.box.value()) { this.box.set_value(lost.join("\n\n")); this.typed = this.box.value(); }
+      return done("Some queued messages couldn't be sent again (is Claude asking something?): they are in the box.");
+    }
+    return done(null);
+  }
+
+  // `work` gets the task's own cx: only that one has sleep (the click's has none, so the first
+  // Cancel in the window stopped right after Up, the message left in Claude's prompt; 2026-11-13).
+  // A row's button: every row shows "…" while the keys run; a refusal brings the buttons back.
+  actOnQueue(agent, cx, work) {
+    const list = this.queueFor(agent.address);
+    for (const x of list) x.acting ??= Date.now();
+    cx.spawn(async (cx) => {
+      const why = await work(list, cx).catch((e) => String(e?.message ?? e));
+      if (!why) return;
+      for (const x of this.queueFor(agent.address)) delete x.acting;
+      this.note(why, cx);
+    });
     cx.notify();
   }
 
-  queuedRow(t, q, k, agent, last) {
+  sendNow(agent, q, cx) {
+    this.actOnQueue(agent, cx, async (list, cx) => {
+      const others = list.filter((x) => x !== q).map((x) => x.text);
+      if (others.length) return this.requeue(agent, others, q.text, cx);
+      await hc(["keys", agent.address, "ctrl+enter"]);
+      return null;
+    });
+  }
+
+  cancelQueued(agent, q, cx) {
+    this.actOnQueue(agent, cx, (list, cx) => this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx));
+  }
+
+  queuedRow(t, q, k, agent) {
     return div().id(`queued-${k}`).w_full().px(12).py(8).rounded(8).border(1).border_color(fade(t.accent, "40"))
       .bg(fade(t.accent, "0d")).text_color(t.muted)
       .child(div().child(TextView.markdown(`queued-text-${k}`, plainMarkdown(q.text)).selectable(true)))
       .child(h_flex().mt(6).gap(10).items_center().text_size(px(11.5)).text_color(t.dim)
-        .child(div().flex_1().min_w(0).truncate().child(q.sent ? "Sending now…" : "Queued · Claude takes it when this turn ends"))
-        .when(last && !q.sent, (el) => el.child(this.button(t, `send-now-${k}`, "Send now", (_e, cx) => this.sendNow(agent, cx))
-          .tooltip("Give it to Claude right away, mid-turn (Enter on its empty prompt)"))));
+        .child(div().flex_1().min_w(0).truncate().child(q.acting ? "…" : "Queued · Claude reads it at its next step, or when this turn ends"))
+        .when(!q.acting, (el) => el
+          .child(this.button(t, `cancel-queued-${k}`, "Cancel", (_e, cx) => this.cancelQueued(agent, q, cx))
+            .tooltip("Take it out of Claude's queue (the others stay queued)"))
+          .child(this.button(t, `send-now-${k}`, "Send now", (_e, cx) => this.sendNow(agent, q, cx))
+            .tooltip("Give this one to Claude right away (the others stay queued)"))));
   }
 
   subChips(t) {
@@ -2109,7 +2298,7 @@ export default class ClaudeChat extends View {
     // Messages sent while Claude works, waiting in its prompt (not in a sub-agent's view).
     if (!sub) {
       const queued = this.queuedNow(agent);
-      rows.push(...queued.map((q, k) => this.queuedRow(t, q, k, agent, k === queued.length - 1)));
+      rows.push(...queued.map((q, k) => this.queuedRow(t, q, k, agent)));
     }
     // Built once each: they're shown only when there is one.
     const chips = this.subChips(t);
