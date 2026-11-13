@@ -1712,7 +1712,10 @@ export default class ClaudeChat extends View {
     if (!list?.length) return [];
     const recent = this.items.slice(-40).filter((x) => x.kind === "user").map((x) => x.text);
     const now = Date.now();
-    const kept = list.filter((q) => !recent.some((u) => u.includes(q.text))
+    // Only for one Claude's log hasn't named yet: a logged one goes by its remove / dequeue line
+    // (a queued "cancel" was hidden because an earlier message held the word, and a Cancel on
+    // the row beside it then dropped both; 2026-11-13).
+    const kept = list.filter((q) => !(!q.logged && recent.some((u) => u.includes(q.text)))
       && (agent.status === "working" || now - q.at < 5000) && !(q.acting && now - q.acting > 8000));
     if (kept.length !== list.length) this.queues.set(agent.address, kept);
     return kept;
