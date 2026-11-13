@@ -389,8 +389,8 @@ const fileOf = (where, session) => (where.container ? `projects/${folderName(ses
 
 // Plain text as markdown that shows it as typed: punctuation escaped, every line break kept.
 const plainEscape = (s) => s.replace(/[\\`*_{}[\]()<>#+\-.!|~&]/g, "\\$&");
-// Claude's empty prompt while it holds queued messages.
-const QUEUE_HINT = /^Press up to edit queued messages\s*$/;
+// Claude's empty prompt while it holds queued messages (a narrow terminal wraps it).
+const QUEUE_HINT = { test: (s) => s.replace(/[^a-z]/gi, "") === "Pressuptoeditqueuedmessages" };
 // What Claude's prompt holds, read off its screen: the lines between the last two rules, after "❯ ".
 function promptText(screen) {
   const lines = screen.split("\n");
@@ -1193,7 +1193,8 @@ export default class ClaudeChat extends View {
       if (d.type === "attachment" && d.attachment?.type === "skill_listing" && into === this) this.learnSkills(d.attachment.content);
       // A message sent during a turn, as Claude took it at its next step (2.1.323: an attachment
       // line; before, a reminder in a user line, see said).
-      if (d.type === "attachment" && d.attachment?.type === "queued_command" && typeof d.attachment.prompt === "string") {
+      if (d.type === "attachment" && d.attachment?.type === "queued_command" && typeof d.attachment.prompt === "string"
+        && (d.attachment.origin?.kind ?? "human") === "human") {
         const text = d.attachment.prompt.trim();
         if (text && !into.items.slice(-6).some((x) => x.mid && x.text === text)) into.items.push({ kind: "user", text, mid: true });
         continue;
@@ -1761,9 +1762,13 @@ export default class ClaudeChat extends View {
     // The screen wraps long lines, so compare without spaces.
     const squash = (x) => x.replace(/\s+/g, "");
     const got = squash(held);
+    // Claude folds a long paste to "[Pasted text #1 +19 lines]": the texts can't be checked
+    // then, and Up took the whole queue (the hint was there), so all are sent again.
+    const folded = /\[Pasted text #\d+/.test(held);
     const lost = [];
     const send = async (text) => {
-      if (!got.includes(squash(text))) return log.push(`not popped: ${JSON.stringify(text.slice(0, 80))}`);
+      // Not on the screen: not sent blind, kept for the box.
+      if (!folded && !got.includes(squash(text))) { lost.push(text); return log.push(`not popped: ${JSON.stringify(text.slice(0, 80))}`); }
       const r = await hc(["send", t, text]).catch((e) => ({ code: 1, stderr: String(e) }));
       if (r.code) { lost.push(text); log.push(`send failed: ${(r.stderr || "").trim().slice(0, 200)}`); }
       return !r.code;
@@ -1780,9 +1785,10 @@ export default class ClaudeChat extends View {
     }
     for (const text of keep) await send(text);
     if (lost.length) {
-      // Claude stopped taking messages (a permission prompt): back into the box, not lost.
+      // Not seen in the prompt, or Claude stopped taking messages (a permission prompt): back
+      // into the box, not lost.
       if (this.address === t && !this.box.value()) { this.box.set_value(lost.join("\n\n")); this.typed = this.box.value(); }
-      return done("Claude stopped taking messages (is it asking something?): the ones not sent again are in the box.");
+      return done("Some queued messages couldn't be sent again (is Claude asking something?): they are in the box.");
     }
     return done(null);
   }
