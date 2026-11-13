@@ -1793,12 +1793,14 @@ export default class ClaudeChat extends View {
     return done(null);
   }
 
+  // `work` gets the task's own cx: only that one has sleep (the click's has none, so the first
+  // Cancel in the window stopped right after Up, the message left in Claude's prompt; 2026-11-13).
   // A row's button: every row shows "…" while the keys run; a refusal brings the buttons back.
   actOnQueue(agent, cx, work) {
     const list = this.queueFor(agent.address);
     for (const x of list) x.acting ??= Date.now();
     cx.spawn(async (cx) => {
-      const why = await work(list).catch((e) => String(e?.message ?? e));
+      const why = await work(list, cx).catch((e) => String(e?.message ?? e));
       if (!why) return;
       for (const x of this.queueFor(agent.address)) delete x.acting;
       this.note(why, cx);
@@ -1807,7 +1809,7 @@ export default class ClaudeChat extends View {
   }
 
   sendNow(agent, q, cx) {
-    this.actOnQueue(agent, cx, async (list) => {
+    this.actOnQueue(agent, cx, async (list, cx) => {
       const others = list.filter((x) => x !== q).map((x) => x.text);
       if (others.length) return this.requeue(agent, others, q.text, cx);
       await hc(["keys", agent.address, "ctrl+enter"]);
@@ -1816,7 +1818,7 @@ export default class ClaudeChat extends View {
   }
 
   cancelQueued(agent, q, cx) {
-    this.actOnQueue(agent, cx, (list) => this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx));
+    this.actOnQueue(agent, cx, (list, cx) => this.requeue(agent, list.filter((x) => x !== q).map((x) => x.text), null, cx));
   }
 
   queuedRow(t, q, k, agent) {
