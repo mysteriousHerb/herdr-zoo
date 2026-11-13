@@ -115,6 +115,11 @@ const px = (n) => Math.round((n * chatLook().size) / 13 * 2) / 2;
 const NARROW = 820;
 // How many messages to draw at first; "Show earlier" adds this many more.
 const PAGE = 120;
+// One of Claude's own boxes is on its screen while Herdr says idle or done (Ctrl+R's history
+// filter, a setup offer like "Teach auto mode about your environment?"): its footer, in the
+// screen's last lines.
+const BOX_FOOTER = /\b(Esc to (cancel|exit|close|go back)|Enter to (continue|confirm|select|submit))\b/i;
+const boxUp = (screen) => BOX_FOOTER.test(screen.replace(/\r/g, "").trim().split("\n").slice(-4).join("\n"));
 // How much of a local transcript is decoded and read at a time (see readAfter).
 const LOAD_SLICE = 4 * 1024 * 1024;
 const MAX_DETAIL = 4000;
@@ -127,9 +132,12 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
   "rewind", "skills", "status", "statusline", "tasks", "theme", "tui", "usage", "workflows"]);
 
 // The header's model / effort bar (see pick), as Claude's /model list names them; the alias is
-// how settings.json's "model" names the default. Read off Claude 2.1.318, 2026-11-05; Fable
-// 5.1 → 5.2 on 2026-11-10 (its release), not read off the list again.
+// how settings.json's "model" names the default. Read off Claude 2.1.318, 2026-11-05. The
+// version numbers go stale (the list still said "Fable 5.1" on 2.1.322, which runs Fable 5.2),
+// so only the family counts: the dropdown shows the running model's own name for its family,
+// and a pick takes the family's row in Claude's list, whatever version it says.
 const MODELS = [["opus", "Opus 5.5"], ["fable", "Fable 5.2"], ["sonnet", "Sonnet 5.5"], ["haiku", "Haiku 5.5"]];
+const family = (label) => String(label ?? "").split(" ")[0];
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // "claude-opus-5-5" → "Opus 5.5"; a display name stays as it is.
 const modelLabel = (m) => {
@@ -527,6 +535,33 @@ function markMarkdown(md, re, color) {
     return head + markInline(rest, mark, test, color);
   }).join("\n");
 }
+// Claude's markdown cut at its code blocks, so each can have a copy button (TextView draws a
+// whole message and has no hook per block): [{ md }] or [{ md, code }], `code` = the block's
+// body. Same fence rule as markMarkdown, but only fences at the line's start: one inside a list
+// or quote stays in its text (cut out, the list would lose its numbering and indent). An
+// unclosed fence runs to the end. Null when there is no block; kept on the item.
+function codeParts(item) {
+  if (item.parts !== undefined) return item.parts;
+  item.parts = null;
+  if (!/^(`{3,}|~{3,})/m.test(item.text)) return null;
+  const parts = [];
+  let text = [], block = null, fence = null;
+  const flush = () => { if (text.join("").trim()) parts.push({ md: text.join("\n") }); text = []; };
+  for (const l of item.text.split("\n")) {
+    const f = /^(`{3,}|~{3,})/.exec(l);
+    if (fence) {
+      block.push(l);
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !l.slice(f[1].length).trim()) {
+        parts.push({ md: block.join("\n"), code: block.slice(1, -1).join("\n") });
+        fence = null;
+      }
+    } else if (f) { flush(); fence = f[1]; block = [l]; }
+    else text.push(l);
+  }
+  if (fence) parts.push({ md: block.join("\n"), code: block.slice(1).join("\n") });
+  else flush();
+  return (item.parts = parts);
+}
 // Your message (see plainMarkdown) with the hits marked.
 const plainMarked = (s, re, color) => s.replace(/\r/g, "").split(/\n\s*\n/)
   .map((p) => p.split("\n").map(marker(re, color, plainEscape)).join("\\\n")).join("\n\n");
@@ -803,6 +838,8 @@ export default class ClaudeChat extends View {
   // "Switching…" until the transcript shows the change (`pending`), or after 12 s that it didn't.
   pick(kind, value, address, cx) {
     this.drop = null;
+    // The picker's keys would land in a box that's open on Claude's screen (see boxText).
+    if (this.screen) { this.pickNote = "Close the box in Claude's terminal first"; return cx.notify(); }
     this.pending = { kind, value, address, until: Date.now() + 12000 };
     this.pickNote = null;
     cx.notify();
@@ -822,10 +859,14 @@ export default class ClaudeChat extends View {
       try {
         if (kind === "model") {
           // Rows "N.  Opus 5.5   …" (row 1 is "Default (recommended)"); Home goes to row 1.
-          const row = new RegExp(`^\\s*(?:❯\\s*)?(\\d+)\\.\\s+${value.replace(/\./g, "\\.")}\\s`, "m");
+          // The family's first row, under the name the list gives it (see MODELS).
+          const row = new RegExp(`^\\s*(?:❯\\s*)?(\\d+)\\.\\s+(${family(value)}\\b[^\\n]*?)(?:\\s*✔)?(?:\\s{2,}|\\s*$)`, "m");
           await inPicker("/model", (s) => /Select model/.test(s) && row.test(s), "model");
-          const n = Number(row.exec(await screen())?.[1] ?? 0);
+          const found = row.exec(await screen());
+          const n = Number(found?.[1] ?? 0);
           if (!n) throw new Error(`${value} isn't in Claude's /model list`);
+          value = found[2].trim();
+          if (this.pending?.address === address && this.pending.kind === "model") this.pending.value = value;
           await hc(["keys", address, "home", ...Array(n - 1).fill("down")]);
           await cx.sleep(100);
           // Only on the right row (the list could have moved): else leave it untouched.
@@ -869,7 +910,7 @@ export default class ClaudeChat extends View {
     const now = kind === "model" ? this.modelNow() : this.effortNow();
     const p = this.pending?.address === this.address && this.pending.kind === kind ? this.pending : null;
     const open = this.drop === kind;
-    const options = kind === "model" ? MODELS.map(([, label]) => label) : EFFORTS;
+    const options = kind === "model" ? MODELS.map(([, label]) => (family(now) === family(label) ? now : label)) : EFFORTS;
     const trigger = h_flex().id(`drop-${kind}-trigger`).flex_none().gap(4).px(8).h(28).items_center().rounded(7)
       .border(1).border_color(open ? t.accent : t.border).bg(t.background).cursor_pointer()
       .text_size(px(12)).text_color(p ? t.accent : t.muted)
@@ -974,7 +1015,8 @@ export default class ClaudeChat extends View {
           }
           if (this.file && this.address === address) await this.loadSubs();
         }
-        const screen = agent.status === "blocked" ? await this.tail(address) : null;
+        const screen = agent.status === "blocked" ? await this.tail(address)
+          : agent.status === "working" ? null : await this.boxText(address);
         if (this.address === address) this.screen = screen;
       } catch (e) {
         this.problem = String(e?.message ?? e);
@@ -1005,6 +1047,19 @@ export default class ClaudeChat extends View {
     while (first > start && !/^\s*(❯\s*)?1\.\s/.test(lines[first])) first--;
     if (first === start) first = lines.length - 3;
     for (let i = first; i > start; i--) if (/^\s*[─━]{20,}/.test(lines[i])) { start = i + 1; break; }
+    return lines.slice(start).filter((l) => l.trim()).join("\n");
+  }
+
+  // A box of Claude's own on the screen of an agent Herdr calls idle or done (see BOX_FOOTER):
+  // its text, from the last rule down. The chat shows it with keys (status), since a message
+  // would be typed into it. null when the screen is the plain prompt.
+  async boxText(address) {
+    const r = await hc(["read", address]).catch(() => null);
+    const text = (r?.stdout ?? "").replace(/\r/g, "");
+    if (!boxUp(text)) return null;
+    const lines = text.trimEnd().split("\n");
+    let start = Math.max(0, lines.length - 40);
+    for (let i = lines.length - 1; i > start; i--) if (/^\s*([^\w\s])\1{19,}\s*$/.test(lines[i])) { start = i + 1; break; }
     return lines.slice(start).filter((l) => l.trim()).join("\n");
   }
 
@@ -1242,14 +1297,22 @@ export default class ClaudeChat extends View {
   // Claude's terminal can be left in one of its own boxes by a stray key (Ctrl+R = "Filter
   // history", seen 2026-11-07: Herdr still says idle, and a send just types into the box, so the
   // chat looked dead). Its footer says "Esc to cancel": press Esc (twice at most) before sending.
+  // False = the box is still there, so nothing may be typed.
   async leaveMenu(address, cx) {
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 3; i++) {
       const r = await hc(["read", address]).catch(() => null);
-      const tail = (r?.stdout ?? "").replace(/\r/g, "").trim().split("\n").slice(-4).join("\n");
-      if (!/\bEsc to (cancel|exit|close|go back)\b/i.test(tail)) return;
+      if (!boxUp(r?.stdout ?? "")) return true;
+      if (i === 2) break;
       await hc(["keys", address, "esc"]);
       await cx.sleep(250);
     }
+    return false;
+  }
+
+  note(text, cx) {
+    this.pasteNote = text;
+    cx.notify();
+    cx.timer.after(6000, (cx) => { if (this.pasteNote === text) { this.pasteNote = null; cx.notify(); } });
   }
 
   send(cx) {
@@ -1267,12 +1330,17 @@ export default class ClaudeChat extends View {
     this.pasted.delete(address);
     const message = [text, ...files.map((f) => `[Image: ${f}]`)].filter(Boolean).join("\n");
     // Pasted images are already in Claude's prompt: Enter alone sends them.
-    const idle = this.target()?.status === "idle";
+    // Done too: Herdr keeps an agent "done" while the Chat is in front, and a box left open after
+    // a turn (the "Teach auto mode" offer, 2026-11-10) took the message and its Enter.
+    const idle = !["working", "blocked"].includes(this.target()?.status);
     // While Claude works, the message waits in its prompt as a queued message: shown in the log
     // until the transcript has it (queuedNow), with "Send now" (steer).
     if (message && this.target()?.status === "working") this.queueFor(address).push({ text: message, at: Date.now() });
     cx.spawn(async (cx) => {
-      if (idle) await this.leaveMenu(address, cx);
+      if (idle && !(await this.leaveMenu(address, cx))) {
+        if (this.address === address && !this.box.value()) { this.box.set_value(text); this.typed = text; }
+        return this.note("Claude's terminal has a box open that Esc didn't close: answer it there first.", cx);
+      }
       await hc(message ? ["send", address, message] : ["keys", address, "enter"]);
     });
     // These open a menu or a screen in Claude's terminal: show it there.
@@ -1302,6 +1370,8 @@ export default class ClaudeChat extends View {
     if (!this.address) return;
     const address = this.address;
     if (this.where?.container) return this.pasteIntoContainer(address, this.where, cx);
+    // The paste key would go to a box open on Claude's screen, not its prompt.
+    if (this.screen && this.target()?.status !== "blocked") return this.note("Close the box in Claude's terminal first", cx);
     this.images = (this.images ?? 0) + 1;
     cx.spawn(async () => { await hc(["keys", address, /^win/.test(os.platform()) ? "alt+v" : "ctrl+v"]); });
     cx.notify();
@@ -1450,11 +1520,31 @@ export default class ClaudeChat extends View {
             .child(svg("mods/workspace-chrome/git-branch.svg").size(13)))));
     }
     if (item.kind === "claude") {
+      const marked = (md) => this.markIn(i) ? markMarkdown(md, this.marks.re, this.markIn(i)) : md;
+      const parts = codeParts(item);
       return h_flex().w_full().gap(8).items_start()
         .on_mouse_down("right", (e) => this.ctxHit(e, item))
         .child(div().mt(4).size(8).flex_none().rounded(4).bg(t.accent))
-        .child(div().flex_1().min_w(0).text_color(t.foreground).child(TextView.markdown(`md-${i}`,
-          this.markIn(i) ? markMarkdown(item.text, this.marks.re, this.markIn(i)) : item.text).selectable(true)));
+        .when(!parts, (el) => el.child(div().flex_1().min_w(0).text_color(t.foreground)
+          .child(TextView.markdown(`md-${i}`, marked(item.text)).selectable(true))))
+        // With code blocks: a TextView per piece, each block with its copy button on top.
+        .when(Boolean(parts), (el) => el.child(v_flex().flex_1().min_w(0).gap(8).text_color(t.foreground)
+          .children(parts.map((p, k) => {
+            const view = TextView.markdown(`md-${i}-${k}`, p.code === undefined ? marked(p.md) : p.md).selectable(true);
+            if (p.code === undefined) return div().w_full().child(view);
+            const id = `copy-${i}-${k}`, done = this.copied === id;
+            return div().relative().w_full().child(view)
+              .child(div().id(id).absolute().top(4).right(4).p(4).rounded(4).bg(t.surface)
+                .text_color(done ? t.accent : t.dim).cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(done ? "Copied" : "Copy code")
+                .on_click((_e, cx) => {
+                  cx.write_to_clipboard(p.code);
+                  this.copied = id; cx.notify();
+                  cx.spawn(async (cx) => { await cx.sleep(1500); if (this.copied === id) { this.copied = null; cx.notify(); } });
+                })
+                .child(svg(`mods/workspace-chrome/${done ? "check" : "files"}.svg`).size(12)));
+          }))));
     }
     if (item.kind === "note") {
       return div().w_full().px(10).py(4).text_size(px(12)).text_color(t.dim)
@@ -1737,18 +1827,28 @@ export default class ClaudeChat extends View {
   }
 
   status(t, agent) {
-    if (agent.status === "blocked") {
+    // A box of Claude's own while Herdr says idle or done (boxText): shown like a blocked prompt.
+    const box = agent.status !== "working" && agent.status !== "blocked" && Boolean(this.screen);
+    if (agent.status === "blocked" || box) {
       // An AskUserQuestion: its own card. Anything else (a permission prompt): the screen.
-      const asking = ask.card(this, t, px);
+      const asking = box ? null : ask.card(this, t, px);
       if (asking) return asking;
+      // The keys the screen itself offers: digits for a numbered list, else arrows.
+      const screen = this.screen ?? "";
+      const foot = screen.split("\n").slice(-3).join(" ");
+      const keys = [...(!screen || /^\s*(❯\s*)?1\.\s/m.test(screen) ? ["1", "2", "3"] : ["up", "down"]),
+        ...(/[←→]/.test(foot) ? ["left", "right"] : [])];
+      const label = { up: "↑", down: "↓", left: "←", right: "→" };
       return v_flex().gap(8).p(10).rounded(8).bg(t.surface).border(1).border_color(t.blocked)
         .child(h_flex().gap(8).items_center()
           .child(div().size(8).rounded(4).bg(t.blocked).loop("opacity", { from: 0.35, to: 1, period: 1200 }))
-          .child(div().font_semibold().text_color(t.foreground).child("Claude is asking")))
+          .child(div().font_semibold().text_color(t.foreground).child(box ? "Claude's terminal is showing this" : "Claude is asking"))
+          .when(box, (el) => el.child(div().flex_1().min_w(0).truncate().text_size(px(11)).text_color(t.dim)
+            .child("Sending a message closes it first (Esc)"))))
         .when(Boolean(this.screen), (el) => el.child(div().p(8).rounded(6).bg(t.background).text_size(px(11))
           .font_family(this.mono()).text_color(t.foreground).child(this.screen)))
         .child(h_flex().gap(6).flex_wrap()
-          .children(["1", "2", "3"].map((k) => this.button(t, `key-${k}`, k, this.keys(k), k === "1")))
+          .children(keys.map((k) => this.button(t, `key-${k}`, label[k] ?? k, this.keys(k), k === "1")))
           .child(this.button(t, "key-enter", "Enter", this.keys("enter")))
           .child(this.button(t, "key-esc", "Esc", this.keys("esc")))
           .child(div().flex_1())
