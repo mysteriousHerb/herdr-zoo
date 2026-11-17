@@ -4,7 +4,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props, knownAgents } from "herdr";
+import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props, knownAgents, nextCommand, exec } from "herdr";
 import PACKS from "./sprites.js";
 
 // The Chat / Terminal stack is one per layout, so a shell tab shows the Terminal side and a
@@ -113,6 +113,19 @@ function find(node, id) {
 
 export default class Tabs extends View {
   init(_props, cx) {
+    // Ctrl+C in a terminal (keys.json: "terminal": { "ctrl-c": "my-tabs.copy" }, the user's ask
+    // 2026-11-17): with a selection it copies, like an editor; else it is the program's interrupt,
+    // sent by hc (a mod has no key to send). This mod gets it because it is in every layout.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        if (c !== "copy") continue;
+        const f = focused();
+        if (!f?.terminal) continue;
+        if (f.selection) { run("terminal.copy"); run("terminal.clear_selection"); }
+        else exec("hc", ["keys", f.terminal, "ctrl+c"]).catch(() => {});
+      }
+    });
     this.pressed = null;
     loadLaunchers(cx);
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
