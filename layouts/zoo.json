@@ -1,5 +1,6 @@
 {
   "id": "root",
+  "terminal_menu": "my-menu",
   "colors": {
     "selection": "#4f7cff59",
     "done": "#8a8f98"
