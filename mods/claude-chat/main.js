@@ -17,44 +17,123 @@ const CLAUDE = `${home()}/.claude`;
 // The chat's look, shared by every copy and kept across restarts; the ⚙ popup changes it.
 // size: the message text in px (the rest scales with it); font: "ui" or "mono" (the terminals');
 // width: "full" or "narrow" (a readable column); tools: "show" or "hide" the tool-call rows;
-// accent: a key of ACCENTS; mine (your messages): "box", "tint" or "bar"; bg: the theme color
-// behind the messages, or a "#rrggbb"; fg: the text color, "theme" or a "#rrggbb";
+// accent: a key of ACCENTS; mine (your messages): "box", "tint" or "bar"; bg: the color
+// behind the messages, "theme" or a "#rrggbb"; fg: the text color, "theme" or a "#rrggbb" (a picked
+// accent, "#rrggbb" background or text color is the whole app's: syncColors);
 // space: "tight", "normal" or "roomy" between them.
 const LOOK = "chat.look";
+// The Chat / Terminal stack, for the tab bar and the agents list to flip ahead of a tab switch.
+const VIEWS = "chat.views";
+const FLIPPED = "chat.flipped";
 // history: earlier turns "fold" (one row each) or "show".
-const LOOK_DEFAULT = { size: 13, font: "ui", width: "full", tools: "show", history: "fold", accent: "theme", mine: "box", bg: "background", fg: "theme", space: "normal" };
+const LOOK_DEFAULT = { size: 13, font: "ui", width: "full", tools: "show", history: "fold", accent: "theme", mine: "box", bg: "theme", fg: "theme", space: "normal" };
 const HEX = /^#[0-9a-f]{6}$/i;
 // Ready-made picks beside the hex boxes: dark and light backgrounds, and text for either.
 const BGS = { "#0d1117": "Night", "#1e1e1e": "Charcoal", "#22201c": "Coffee", "#f6f1e7": "Paper", "#ffffff": "White" };
 const FGS = { "#e6edf3": "Soft white", "#c9d1d9": "Gray", "#f0dfbf": "Cream", "#24292f": "Ink", "#000000": "Black" };
-const chatLook = () => ({ ...LOOK_DEFAULT, ...(shared(LOOK) ?? {}) });
-const setLook = (change) => {
-  setShared(LOOK, { ...chatLook(), ...change });
-  if ("fg" in change) syncForeground();
+// A bg saved as a theme surface ("chrome", "canvas": pills dropped 2026-11-17) reads as the theme's.
+const chatLook = () => {
+  const look = { ...LOOK_DEFAULT, ...(shared(LOOK) ?? {}) };
+  return HEX.test(look.bg) ? look : { ...look, bg: "theme" };
 };
-// Message text is Herdr's TextView, which only ever takes the theme's foreground, so a chosen
-// text color goes into settings.json's colors.foreground: the whole app's text (the user's choice,
-// 2026-10-31). "theme" removes it. writeTextFile refuses if the file changed since it was read.
-async function syncForeground() {
-  const fg = chatLook().fg;
+const GLOBAL = ["fg", "bg", "accent"];
+const setLook = (change) => {
+  setShared(LOOK, change ? { ...chatLook(), ...change } : null);
+  if (!change || GLOBAL.some((key) => key in change)) syncColors();
+};
+// null = the theme's own accent.
+const ACCENTS = { theme: null, claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
+const mix = (a, b, k) => "#" + [1, 3, 5].map((i) =>
+  Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - k) + parseInt(b.slice(i, i + 2), 16) * k).toString(16).padStart(2, "0")).join("");
+// The picked colors are the whole app's, not just the chat's (a purple chat beside a black
+// sidebar looked bad; the user's report 2026-11-17): the theme colors the look stands for.
+// A picked background brings the surfaces around it, since Herdr derives those from the
+// theme file, not from an overridden `background` (probed: the sidebar and bars stayed black):
+// bars and the canvas a little deeper, raised things a little toward white (black on a light pick).
+// Terminal palettes for a background the theme's own doesn't suit (a dark theme's pale ANSI
+// colors on Paper were unreadable, the user's screenshot 2026-11-17): light = GitHub's light
+// scheme, dark = its dark one, ansi0..ansi15.
+const ANSI = {
+  light: ["#24292f", "#cf222e", "#116329", "#9a6700", "#0969da", "#8250df", "#1b7c83", "#6e7781",
+    "#57606a", "#a40e26", "#1a7f37", "#7d4e00", "#218bff", "#a475f9", "#3192aa", "#8c959f"],
+  dark: ["#484f58", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#b1bac4",
+    "#6e7681", "#ffa198", "#56d364", "#e3b341", "#79c0ff", "#d2a8ff", "#56d4dd", "#f0f6fc"],
+};
+const isDark = (color) => [1, 3, 5].reduce((n, i, j) => n + parseInt(color.slice(i, i + 2), 16) * [0.299, 0.587, 0.114][j], 0) < 128;
+function lookColors(look) {
+  const out = {};
+  if (HEX.test(look.fg)) out.foreground = look.fg;
+  if (ACCENTS[look.accent]) out.accent = ACCENTS[look.accent];
+  if (HEX.test(look.bg)) {
+    const bg = look.bg.toLowerCase();
+    const dark = isDark(bg);
+    const ink = dark ? "#ffffff" : "#000000";
+    // A light background under a dark theme (or the other way) with the text left as the
+    // theme's: white text on Paper (the user's report 2026-11-17), so the text goes with the
+    // background, Ink or Soft white from FGS.
+    // Whether the theme itself is dark comes from its `solid` (a primary button: paper in a dark
+    // theme, ink in a light one), a color the chat never writes: `foreground` is already the
+    // chat's own override once written (it kept the palette from landing, 2026-11-17).
+    const themeDark = HEX.test(theme().solid) ? !isDark(theme().solid) : null;
+    if (themeDark !== null && themeDark !== dark) {
+      if (!out.foreground) out.foreground = dark ? "#e6edf3" : "#24292f";
+      ANSI[dark ? "dark" : "light"].forEach((color, i) => { out[`ansi${i}`] = color; });
+      // Programs' own 24-bit colors (PowerShell's gray prompt and tables) stay pale on Paper, so
+      // Herdr's minimum_contrast (text under the ratio drawn near-black/near-white) goes to 2:
+      // readable in the user's terminal, 2026-11-17. Not a color: syncColors takes it out.
+      out.$contrast = 2;
+    }
+    Object.assign(out, {
+      background: bg, chrome: mix(bg, "#000000", dark ? 0.3 : 0.04), canvas: mix(bg, "#000000", dark ? 0.42 : 0.07),
+      surface: mix(bg, ink, 0.05), input: mix(bg, ink, 0.05), popover: mix(bg, ink, 0.06), hover: mix(bg, ink, 0.08),
+      raised: mix(bg, ink, 0.09), selected: mix(bg, ink, 0.13), border: mix(bg, ink, 0.14),
+    });
+  }
+  return out;
+}
+// They go into settings.json's `colors` (message text is Herdr's TextView, which only ever takes
+// the theme's foreground, so for text there was never another way). Shared `chat.wrote` is what
+// the chat put there: going back to the theme's removes only those, and only if still as written,
+// so colors set by hand stay. writeTextFile refuses if the file changed since it was read.
+const WROTE = "chat.wrote";
+const CONTRAST = "chat.contrast";
+async function syncColors() {
   const path = `${appHome()}/settings.json`;
   for (let tries = 0; tries < 2; tries++) {
+    const { $contrast, ...want } = lookColors(chatLook());
+    // Until 2026-11-17 only the text color was written, with no record of it.
+    const wrote = shared(WROTE) ?? (want.foreground ? { foreground: want.foreground } : {});
     const text = await readTextFile(path);
     const s = JSON.parse(text ?? "{}");
-    const now = s.colors?.foreground;
-    if (HEX.test(fg) ? now === fg : now === undefined) return;
     const colors = { ...(s.colors ?? {}) };
-    if (HEX.test(fg)) colors.foreground = fg;
-    else delete colors.foreground;
-    if (Object.keys(colors).length) s.colors = colors;
-    else delete s.colors;
-    try {
-      await writeTextFile(path, JSON.stringify(s, null, 2) + "\n", text);
-      return;
-    } catch {}
+    for (const [key, value] of Object.entries(wrote)) if (!(key in want) && colors[key] === value) delete colors[key];
+    Object.assign(colors, want);
+    // minimum_contrast: set with the palette, put back to what it was without it (the value
+    // before the chat set it is kept beside the record, `$was`).
+    const was = shared(CONTRAST);
+    let contrast = s.minimum_contrast;
+    if ($contrast && (s.minimum_contrast ?? 1) !== $contrast) contrast = $contrast;
+    else if (!$contrast && was && s.minimum_contrast === was.set) contrast = was.$was;
+    const same = JSON.stringify(colors) === JSON.stringify(s.colors ?? {}) && contrast === s.minimum_contrast;
+    if (same && JSON.stringify(wrote) === JSON.stringify(want)) return;
+    if (!same) {
+      if (Object.keys(colors).length) s.colors = colors;
+      else delete s.colors;
+      if (contrast !== s.minimum_contrast) {
+        if ($contrast) setShared(CONTRAST, { set: $contrast, $was: s.minimum_contrast });
+        else setShared(CONTRAST, null);
+        if (contrast === undefined) delete s.minimum_contrast;
+        else s.minimum_contrast = contrast;
+      }
+      try {
+        await writeTextFile(path, JSON.stringify(s, null, 2) + "\n", text);
+      } catch { continue; }
+    }
+    setShared(WROTE, want);
+    return;
   }
 }
-syncForeground();
+syncColors().catch(() => {});
 // "Claude (dev container)" in the + menu (`my-new-menu`), switched in the ⚙ popup: on = this
 // computer's programs.json has the entry, so that file is the setting. On by default (the user's
 // choice 2026-11-02; the space's folder must hold the .devcontainer, the standard VS Code layout): the first run
@@ -96,14 +175,12 @@ if (shared(DEV_CHOICE) == null && /^win/.test(os.platform())) {
 } else if (shared(DEV_CHOICE) === true) {
   setDevContainer(true).catch(() => {}); // moves an OLD_RUN entry to the new one
 }
-// null = the theme's own accent.
-const ACCENTS = { theme: null, claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
 const GAPS = { tight: 6, normal: 10, roomy: 16 };
 // The theme with the chat's accent and background swapped in.
 function chatTheme() {
   const t = theme();
   const look = chatLook();
-  const out = { ...t, accent: ACCENTS[look.accent] ?? t.accent, background: HEX.test(look.bg) ? look.bg : t[look.bg] ?? t.background };
+  const out = { ...t, accent: ACCENTS[look.accent] ?? t.accent, background: HEX.test(look.bg) ? look.bg : t.background };
   // A chosen text color also makes the secondary text: the same color, fainter.
   if (HEX.test(look.fg)) Object.assign(out, { foreground: look.fg, muted: look.fg + "d9", dim: look.fg + "99" });
   return out;
@@ -138,6 +215,30 @@ const OPENS = new Set(["add-dir", "agents", "artifacts", "color", "config", "con
 // and a pick takes the family's row in Claude's list, whatever version it says.
 const MODELS = [["opus", "Opus 5.5"], ["fable", "Fable 5.2"], ["sonnet", "Sonnet 5.5"], ["haiku", "Haiku 5.5"]];
 const family = (label) => String(label ?? "").split(" ")[0];
+// Claude's real list, read off its /model picker (2026-11-17: the older ones, Fable 5.1 among
+// them, are behind its "More models" row): shared { "<container id | local>": { main, more, at } }.
+const MODEL_LIST = "chat.models";
+const MORE = "More models";
+// The /model picker on a screen: its rows in order ("N.  Opus 5.5 ✔   For…"; `at` = presses of
+// Down from the top row, `cursor` = the ❯ is on it, `older` = under "More models") and that
+// row ("▸   More models", ▾ when open). Null when the picker isn't up: `hc read` gives the
+// history too, and a chat can quote these very lines, so the picker's footer must end the screen.
+function modelRows(screen) {
+  const from = screen.lastIndexOf("Select model");
+  if (from < 0) return null;
+  const rows = [];
+  let more = null;
+  let at = 0;
+  const lines = screen.slice(from).trimEnd().split("\n").slice(1);
+  if (!/Enter to .*Esc to cancel/.test(lines[lines.length - 1] ?? "")) return null;
+  for (const line of lines) {
+    const r = /^\s*(❯\s*)?(\d+)\.\s+(.*?)(?:\s*✔)?(?:\s{2,}.*)?$/.exec(line);
+    const m = /^\s*(❯\s*)?([▸▾])\s+More models/.exec(line);
+    if (r) rows.push({ name: r[3].trim(), at: at++, cursor: Boolean(r[1]), older: Boolean(more) });
+    else if (m) more = { at: at++, open: m[2] === "▾", cursor: Boolean(m[1]) };
+  }
+  return { rows, more };
+}
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // "claude-opus-5-5" → "Opus 5.5"; a display name stays as it is.
 const modelLabel = (m) => {
@@ -589,6 +690,8 @@ function starting(tab) {
 
 export default class ClaudeChat extends View {
   init(_props, cx) {
+    const { stack, self, other } = props() ?? {};
+    if (stack && !props()?.terminal) setShared(VIEWS, { stack, self, other });
     if (props()?.settings) {
       // Hex boxes for any background or text color; a full #rrggbb takes effect as it's typed.
       const look = chatLook();
@@ -799,12 +902,15 @@ export default class ClaudeChat extends View {
     if (!stack || props()?.terminal || tab == null) return;
     const empty = !agent && !starting(tab);
     const showing = this.showing();
-    if (showing) this.flipped = false;
+    // Whether the Terminal side is the chat's own doing is shared (chat.flipped): my-tabs and
+    // zoo-agents flip the stack ahead of a tab switch (their preflip), which removed the twitch
+    // of flipping after the tab drew (2026-11-17); this is the fallback (keys, other mods).
+    if (showing && shared(FLIPPED)) setShared(FLIPPED, false);
     if (empty && showing) {
-      this.flipped = true;
+      setShared(FLIPPED, true);
       run("layout.select", { stack, child: other });
-    } else if (this.flipped && !empty) {
-      this.flipped = false;
+    } else if (shared(FLIPPED) && !empty) {
+      setShared(FLIPPED, false);
       run("layout.select", { stack, child: self });
     }
   }
@@ -840,9 +946,11 @@ export default class ClaudeChat extends View {
   // "Switching…" until the transcript shows the change (`pending`), or after 12 s that it didn't.
   pick(kind, value, address, cx) {
     this.drop = null;
+    // One run of keys at a time on a terminal.
+    if (this.listing || this.pending) return;
     // The picker's keys would land in a box that's open on Claude's screen (see boxText).
     if (this.screen) { this.pickNote = "Close the box in Claude's terminal first"; return cx.notify(); }
-    this.pending = { kind, value, address, until: Date.now() + 12000 };
+    this.pending = { kind, value, address, until: Date.now() + 20000 };
     this.pickNote = null;
     cx.notify();
     cx.spawn(async (cx) => {
@@ -860,20 +968,16 @@ export default class ClaudeChat extends View {
       };
       try {
         if (kind === "model") {
-          // Rows "N.  Opus 5.5   …" (row 1 is "Default (recommended)"); Home goes to row 1.
-          // The family's first row, under the name the list gives it (see MODELS).
-          const row = new RegExp(`^\\s*(?:❯\\s*)?(\\d+)\\.\\s+(${family(value)}\\b[^\\n]*?)(?:\\s*✔)?(?:\\s{2,}|\\s*$)`, "m");
-          await inPicker("/model", (s) => /Select model/.test(s) && row.test(s), "model");
-          const found = row.exec(await screen());
-          const n = Number(found?.[1] ?? 0);
-          if (!n) throw new Error(`${value} isn't in Claude's /model list`);
-          value = found[2].trim();
+          // The row of that name (walkModels opens "More models" for an older one); else (a
+          // name from MODELS, gone stale) the family's first row, under the name the list gives it.
+          await inPicker("/model", (s) => Boolean(modelRows(s)?.rows.length), "model");
+          let at = await this.walkModels(address, cx, (name) => name === value);
+          if (!at.found) at = await this.walkModels(address, cx, (name) => !/^Default/.test(name) && family(name) === family(value));
+          if (!at.found) { await hc(["keys", address, "esc"]); throw new Error(`${value} isn't in Claude's /model list`); }
+          value = at.seen[at.seen.length - 1];
           if (this.pending?.address === address && this.pending.kind === "model") this.pending.value = value;
-          await hc(["keys", address, "home", ...Array(n - 1).fill("down")]);
-          await cx.sleep(100);
-          // Only on the right row (the list could have moved): else leave it untouched.
-          const at = /^\s*❯\s*\d+\.\s+(.*?)\s{2,}/m.exec(await screen())?.[1];
-          if (at?.replace(/\s*✔$/, "") !== value) { await hc(["keys", address, "esc"]); throw new Error(`Couldn't select ${value}`); }
+          // Only on the right row: else leave it untouched.
+          if (modelRows(await screen())?.rows.find((r) => r.cursor)?.name !== value) { await hc(["keys", address, "esc"]); throw new Error(`Couldn't select ${value}`); }
           await hc(["keys", address, "s"]);
         } else {
           // The effort slider starts at the current level; ← five times is low.
@@ -894,6 +998,84 @@ export default class ClaudeChat extends View {
     });
   }
 
+  // With /model open: walks the cursor down from the top row, a row at a time, until
+  // `stop(name)` or the end, opening "More models" on the way (Enter with the cursor read on it:
+  // on a model's row Enter would save the default). The names passed, in order, MORE among them.
+  // Not by counting rows off the screen: a pane-high terminal shows only some ("↓ 4 more") and
+  // scrolls, and a fixed wait after the keys was too short on a long chat ("Couldn't select
+  // Fable 5.1", the user's report 2026-11-17), so each press waits for the cursor to move.
+  async walkModels(address, cx, stop) {
+    const read = async () => modelRows((await hc(["read", address])).stdout.replace(/\r/g, ""));
+    const cursor = (list) => (list?.more?.cursor ? MORE : list?.rows.find((r) => r.cursor)?.name);
+    const until = async (test, tries) => {
+      for (let i = 0; i < tries; i++) {
+        await cx.sleep(80);
+        const list = await read();
+        if (list && test(list)) return list;
+      }
+      return null;
+    };
+    await hc(["keys", address, "home"]);
+    let list = await until((l) => l.rows[0]?.cursor, 15);
+    const seen = [];
+    while (list && seen.length < 40) {
+      const now = cursor(list);
+      if (!now || seen.includes(now)) break; // the end, or the list wrapped round
+      seen.push(now);
+      if (stop?.(now)) return { seen, found: true, whole: false };
+      if (now === MORE && !list.more.open) {
+        await hc(["keys", address, "enter"]);
+        if (!(await until((l) => l.more?.open && l.more.cursor, 15))) break;
+      }
+      await hc(["keys", address, "down"]);
+      list = await until((l) => cursor(l) && cursor(l) !== now, 10);
+    }
+    // Whole = it ran off the end (the cursor stopped moving, or came back to the top).
+    const whole = seen.length > 1 && (list === null || seen.includes(cursor(list)));
+    this.keepModels(seen, whole);
+    return { seen, found: false, whole };
+  }
+
+  // Claude's list for the dropdown, per computer or container (shared MODEL_LIST).
+  modelsKey() { return this.where?.container ?? "local"; }
+  keepModels(seen, whole) {
+    if (!whole) return;
+    const names = seen.filter((name) => !/^Default/.test(name));
+    const cutAt = names.indexOf(MORE);
+    const main = cutAt < 0 ? names : names.slice(0, cutAt);
+    // A session on an older model has it among the first rows as well: listed once.
+    const more = cutAt < 0 ? [] : names.slice(cutAt + 1).filter((name) => !main.includes(name));
+    setShared(MODEL_LIST, { ...(shared(MODEL_LIST) ?? {}), [this.modelsKey()]: { main, more, at: Date.now() } });
+  }
+
+  // The dropdown's "More models": the first time (and once a day) the list is read off Claude's
+  // own /model picker, opened on this agent's terminal and closed again with Esc.
+  readModels(address, cx) {
+    if (this.listing || this.pending) return;
+    if (this.screen) { this.pickNote = "Close the box in Claude's terminal first"; return cx.notify(); }
+    this.listing = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        await hc(["keys", address, ..."/model".split("")]);
+        await hc(["keys", address, "enter"]);
+        let list = null;
+        for (let i = 0; i < 20 && !list?.rows.length; i++) {
+          await cx.sleep(150);
+          list = modelRows((await hc(["read", address])).stdout.replace(/\r/g, ""));
+        }
+        const walk = list?.rows.length ? await this.walkModels(address, cx) : null;
+        await hc(["keys", address, "esc"]);
+        if (!walk) this.pickNote = "Claude's model picker didn't open";
+        else if (!walk.whole) this.pickNote = "Couldn't read Claude's model list";
+      } catch (e) {
+        this.pickNote = String(e?.message ?? e);
+      }
+      this.listing = false;
+      cx.notify();
+    });
+  }
+
   // Whether the pick in flight has landed (the transcript names it) or timed out.
   settlePick() {
     const p = this.pending;
@@ -903,39 +1085,63 @@ export default class ClaudeChat extends View {
     else if (Date.now() > p.until) { this.pending = null; this.pickNote = "No change seen: look at the Terminal"; }
   }
 
-  // The model and effort dropdowns at the right of the box: the trigger shows the current one
-  // (or "Opus 5.5…" while a pick lands), the list opens upward with the current one ticked.
+  // The model and effort dropdown at the right of the box (one button since 2026-11-17, the
+  // user's ask; it was two): the trigger shows both, "Fable 5.2 · high" (the one a pick is landing
+  // on as "high…"), the list opens upward: models, then efforts, the current of each ticked.
   // Picks only while Claude waits for you: a pick while it works would queue behind the turn,
   // and keys typed into the effort picker would land in its prompt instead.
-  dropdown(t, agent, kind) {
-    const ready = agent.status !== "working" && agent.status !== "blocked";
-    const now = kind === "model" ? this.modelNow() : this.effortNow();
-    const p = this.pending?.address === this.address && this.pending.kind === kind ? this.pending : null;
-    const open = this.drop === kind;
-    const options = kind === "model" ? MODELS.map(([, label]) => (family(now) === family(label) ? now : label)) : EFFORTS;
-    const trigger = h_flex().id(`drop-${kind}-trigger`).flex_none().gap(4).px(8).h(28).items_center().rounded(7)
+  dropdown(t, agent) {
+    const now = { model: this.modelNow(), effort: this.effortNow() };
+    const p = this.pending?.address === this.address ? this.pending : null;
+    // Not while a pick or a read of the list has Claude's picker open either.
+    const ready = agent.status !== "working" && agent.status !== "blocked" && !this.listing && !this.pending;
+    const open = Boolean(this.drop);
+    const shown = (kind) => (p?.kind === kind ? `${p.value}…` : now[kind]);
+    const label = [shown("model") ?? "Model", shown("effort")].filter(Boolean).join(" · ");
+    const trigger = h_flex().id("drop-trigger").flex_none().gap(4).px(8).h(28).items_center().rounded(7)
       .border(1).border_color(open ? t.accent : t.border).bg(t.background).cursor_pointer()
       .text_size(px(12)).text_color(p ? t.accent : t.muted)
       .hover((s) => s.text_color(t.foreground).border_color(t.input))
-      .tooltip(kind === "model" ? "Model (this session only)" : "Effort (this session only)")
-      .child(p ? `${p.value}…` : now ?? (kind === "model" ? "Model" : "Effort"))
+      .tooltip("Model and effort (this session only)")
+      .child(label)
       .child(svg("mods/workspace-chrome/chevron-down.svg").size(12).text_color(t.dim));
-    const row = (value) => h_flex().id(`drop-${kind}-${value}`).gap(8).px(8).h(26).items_center().rounded(5).text_size(px(12.5))
-      .when(value === now, (el) => el.text_color(t.foreground).bg(t.selected))
-      .when(value !== now && ready, (el) => el.cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+    const row = (kind) => (value) => h_flex().id(`drop-${kind}-${value}`).gap(8).px(8).h(26).items_center().rounded(5).text_size(px(12.5))
+      .when(value === now[kind], (el) => el.text_color(t.foreground).bg(t.selected))
+      .when(value !== now[kind] && ready, (el) => el.cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
         .on_click((_e, cx) => { this.drop = null; this.pick(kind, value, agent.address, cx); this.box.focus(); }))
-      .when(value !== now && !ready, (el) => el.text_color(t.dim))
-      .child(div().w(12).flex_none().text_color(t.accent).child(value === now ? "✓" : ""))
+      .when(value !== now[kind] && !ready, (el) => el.text_color(t.dim))
+      .child(div().w(12).flex_none().text_color(t.accent).child(value === now[kind] ? "✓" : ""))
       .child(value);
-    return Popover.new(`drop-${kind}`).anchor("bottom_right")
+    const head = (text) => div().px(8).pt(4).pb(2).text_size(px(10.5)).text_color(t.dim).child(text);
+    // Claude's own list once it has been read (a pick or "More models" reads it), else MODELS.
+    const list = shared(MODEL_LIST)?.[this.modelsKey()];
+    const main = list?.main?.length ? list.main : MODELS.map(([, name]) => (family(now.model) === family(name) ? now.model : name));
+    const older = list?.more ?? [];
+    const stale = Date.now() - (list?.at ?? 0) > 86400000;
+    const moreOpen = this.moreOpen ?? older.includes(now.model);
+    const more = h_flex().id("drop-more").gap(8).px(8).h(26).items_center().rounded(5).text_size(px(12.5)).text_color(t.dim)
+      .when(ready || older.length > 0, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => {
+          this.moreOpen = !moreOpen;
+          if (this.moreOpen && stale && ready) this.readModels(agent.address, cx);
+          cx.notify();
+        }))
+      .child(div().w(12).flex_none().child(moreOpen ? "▾" : "▸"))
+      .child(this.listing ? "Reading Claude's list…" : "More models");
+    return Popover.new("drop").anchor("bottom_right")
       .open(open)
-      .on_open_change((o, cx) => { this.drop = o ? kind : null; this.pickNote = null; cx.notify(); })
+      .on_open_change((o, cx) => { this.drop = o ? "open" : null; this.pickNote = null; cx.notify(); })
       .trigger(trigger)
-      .content(v_flex().w(kind === "model" ? 190 : 230).p(4).gap(1).mb(6).rounded(8).bg(t.popover).border(1).border_color(t.border)
-        .children(options.map(row))
+      .content(v_flex().w(230).p(4).gap(1).mb(6).rounded(8).bg(t.popover).border(1).border_color(t.border)
+        .child(head("Model"))
+        .children(main.map(row("model")))
+        .child(more)
+        .when(moreOpen, (el) => el.children(older.map(row("model"))))
+        .child(div().my(4).h(1).bg(t.border))
+        .child(head("Effort"))
+        .children(EFFORTS.map(row("effort")))
         .child(div().px(8).pt(6).pb(2).text_size(px(10.5)).text_color(t.dim)
-          .child(!ready ? "Can change once Claude stops"
-            : kind === "effort" ? "This session only. Mid-chat, the next reply re-reads the history." : "This session only")));
+          .child(!ready ? "Can change once Claude stops" : "This session only. Mid-chat, a new effort makes the next reply re-read the history.")));
   }
 
   toTerminal(address) {
@@ -1979,7 +2185,7 @@ export default class ClaudeChat extends View {
     // Swatches (a ring on the chosen one) and a hex box for any other color.
     const colors = (key, choices) => h_flex().flex_none().gap(6).items_center()
       .children(Object.entries(choices).map(([value, name]) => div().id(`look-${key}-${value}`).size(18).rounded(9).cursor_pointer()
-        .bg(value === "theme" ? theme().foreground : value)
+        .bg(value !== "theme" ? value : key === "fg" ? theme().foreground : "#00000000")
         .border(2).border_color(String(look[key]).toLowerCase() === value ? t.accent : t.border)
         .tooltip(name)
         .on_click(() => { setLook({ [key]: value }); this.hex[key].set_value(HEX.test(value) ? value : ""); })))
@@ -1989,20 +2195,19 @@ export default class ClaudeChat extends View {
       .child(h_flex().px(8).pt(4).pb(4).items_center().justify_between()
         .child(div().text_size(11).text_color(t.dim).child("Chat"))
         .child(div().id("look-reset").text_size(11).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-          .on_click(() => { setShared(LOOK, null); for (const s of Object.values(this.hex)) s.set_value(""); }).child("Reset")))
+          .on_click(() => { setLook(null); for (const s of Object.values(this.hex)) s.set_value(""); }).child("Reset")))
       .child(row("Text size", pills(step("look-smaller", "A−", -1), div().w(28).text_center().text_color(t.foreground).child(String(look.size)), step("look-bigger", "A+", 1))))
       .child(row("Font", pills(seg("font", "ui", "Sans"), seg("font", "mono", "Mono"))))
       .child(row("Width", pills(seg("width", "full", "Full"), seg("width", "narrow", "Narrow"))))
       .child(row("Tool calls", pills(seg("tools", "show", "Show"), seg("tools", "hide", "Hide"))))
       .child(row("Earlier turns", pills(seg("history", "fold", "Fold"), seg("history", "show", "Show"))))
-      .child(row("Accent", h_flex().flex_none().gap(6).children(Object.entries(ACCENTS).map(([key, color]) =>
+      .child(row("Accent (all of Herdr)", h_flex().flex_none().gap(6).children(Object.entries(ACCENTS).map(([key, color]) =>
         div().id(`look-accent-${key}`).size(18).rounded(9).cursor_pointer().bg(color ?? t.accent)
           .border(2).border_color(look.accent === key ? t.foreground : "#00000000")
           .tooltip(key === "theme" ? "Theme's accent" : key[0].toUpperCase() + key.slice(1))
           .on_click(() => setLook({ accent: key }))))))
       .child(row("Your messages", pills(seg("mine", "box", "Box"), seg("mine", "tint", "Tint"), seg("mine", "bar", "Bar"))))
-      .child(row("Background", pills(seg("bg", "background", "Terminal"), seg("bg", "chrome", "Panel"), seg("bg", "canvas", "Canvas"))))
-      .child(row("", colors("bg", BGS)))
+      .child(row("Background (all of Herdr)", colors("bg", { theme: "Theme's", ...BGS })))
       .child(row("Text (all of Herdr)", colors("fg", { theme: "Theme's", ...FGS })))
       .child(row("Spacing", pills(seg("space", "tight", "Tight"), seg("space", "normal", "Normal"), seg("space", "roomy", "Roomy"))))
       .child(div().px(8).pt(10).pb(4).text_size(11).text_color(t.dim).child("+ menu"))
@@ -2250,9 +2455,13 @@ export default class ClaudeChat extends View {
     const root = v_flex().size_full().min_h(0).bg(t.background).text_size(px(13));
     // The chosen font goes to the messages and the box, not the header.
     const font = (el) => el.when(look.font === "mono", (el) => el.font_family(this.mono()));
+    // Both flips happen now rather than on the next 2 s tick: a tab with no Claude goes to the
+    // Terminal, and a tab with one comes back to the chat when the chat itself flipped the stack
+    // away (going from a shell tab to a Claude tab showed its terminal for up to 2 s, then the
+    // chat; the user's report 2026-11-17). The stack is one per layout, so a flip is unavoidable
+    // when the tabs differ; this keeps it to a frame.
+    if (props()?.stack && (!agent || shared(FLIPPED))) cx.timer.after(0, () => this.autoView(agent));
     if (!agent) {
-      // A tab with no Claude goes to the Terminal now rather than on the next 2 s tick.
-      if (props()?.stack) cx.timer.after(0, () => this.autoView(null));
       const text = starting(focused()?.tab) ? "Starting Claude…" : "No Claude agent in this tab.";
       return root.items_center().justify_center().gap(10).text_color(t.dim).child(text)
         .when(Boolean(props()?.stack), (el) => el.child(this.button(t, "show-terminal", "Show terminal", () => this.toTerminal())));
@@ -2328,11 +2537,6 @@ export default class ClaudeChat extends View {
           .tooltip("Search this chat (Ctrl+F)")
           .on_click((_e, cx) => (this.findOpen ? this.closeFind(cx) : this.openFind(cx)))
           .child(svg("mods/workspace-chrome/search.svg").size(14)))
-        .when(Boolean(this.session?.sessionId) && !sub, (el) => el.child(div().id("chat-fork").flex_none().p(4).rounded(6)
-          .text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .tooltip("Fork: a copy of this conversation in a new tab")
-          .on_click((_e, cx) => cx.spawn(async (cx) => { await this.fork(agent, undefined, cx); }))
-          .child(svg("mods/workspace-chrome/git-branch.svg").size(14))))
         .child(div().id("chat-settings").flex_none().p(4).rounded(6).text_color(t.dim).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Chat settings")
@@ -2370,6 +2574,6 @@ export default class ClaudeChat extends View {
           .gap(6).items_end()
           .child(div().flex_1().min_w(0).p(6).rounded(8).bg(t.background).border(1).border_color(t.input)
             .child(Textarea.new(this.box)))
-          .child(h_flex().flex_none().gap(6).pb(4).child(this.dropdown(t, agent, "model")).child(this.dropdown(t, agent, "effort")))));
+          .child(h_flex().flex_none().gap(6).pb(4).child(this.dropdown(t, agent)))));
   }
 }

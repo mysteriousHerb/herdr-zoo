@@ -7,6 +7,29 @@ import { agents, terminals, panes, focused, spaces, run, theme, shared, setShare
 import PACKS from "./sprites.js";
 import { startJobs } from "./jobs.js";
 
+// The Chat / Terminal stack is one per layout, so a shell tab shows the Terminal side and a
+// Claude tab the chat (claude-chat's autoView). Done there, the flip came a frame after the tab
+// drew: a twitch on every switch (the user's report 2026-11-17). So a row click flips the stack
+// first, by the tab it is going to; shared chat.views names the stack and chat.flipped whether
+// the Terminal side is the chat's own doing (a Terminal picked by hand stays).
+function preflip(tab) {
+  const views = shared("chat.views");
+  if (!views || tab == null) return;
+  const hasClaude = agents().some((a) => a.app === "claude-code" && a.tab === tab)
+    || panes().some((p) => p.tab === tab && p.terminal && /^claude/.test(p.program?.key ?? ""));
+  const find = (node) => (node?.id === views.stack ? node : (node?.children ?? []).map(find).find(Boolean));
+  const node = find(layout());
+  const active = node?.active ?? node?.children?.[0]?.id;
+  if (!hasClaude && active === views.self) {
+    setShared("chat.flipped", true);
+    run("layout.select", { stack: views.stack, child: views.other });
+  } else if (hasClaude && active === views.other && shared("chat.flipped")) {
+    setShared("chat.flipped", false);
+    run("layout.select", { stack: views.stack, child: views.self });
+  }
+}
+
+
 function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) {
@@ -448,7 +471,7 @@ export default class Agents extends View {
           .items_center()
           .gap(4)
           .hover((s) => s.bg(t.hover))
-          .on_click(() => run("pane.focus", { pane: a.pane }))
+          .on_click(() => { preflip(a.tab); run("pane.focus", { pane: a.pane }); })
           .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(t.muted).child(String(i + 1)))
           .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.status(t, { status: shownStatus(a) }, true)));
       }
@@ -511,7 +534,7 @@ export default class Agents extends View {
           else if (this.hovered === a.address) this.hovered = null;
           cx.notify();
         })
-        .on_click(() => run("pane.focus", { pane: a.pane }))
+        .on_click(() => { preflip(a.tab); run("pane.focus", { pane: a.pane }); })
         // The zoo's own menu (an overlay of the zoo mod): change its character, close the agent.
         .on_mouse_down("right", () => openOverlay({
           mod: "zoo", kind: "popup", width: 220, height: 205,
