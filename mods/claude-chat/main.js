@@ -5,7 +5,8 @@
 // Claude agent). A dev container's Claude (docker exec ... claude) is read through docker.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView, TextareaState, Textarea, InputState, Input, Popover } from "gpui-base";
+import { v_flex, h_flex, TextView, TextareaState, Textarea, InputState, Input, Popover,
+  SliderState, Slider, SliderTrack, SliderIndicator, SliderThumb } from "gpui-base";
 import { readFile, readdir, exists, writeFile } from "fs/promises";
 import os from "os";
 import { Buffer } from "buffer";
@@ -29,20 +30,44 @@ const FLIPPED = "chat.flipped";
 const LOOK_DEFAULT = { size: 13, font: "ui", width: "full", tools: "show", history: "fold", accent: "theme", mine: "box", bg: "theme", fg: "theme", space: "normal" };
 const HEX = /^#[0-9a-f]{6}$/i;
 // Ready-made picks beside the hex boxes: dark and light backgrounds, and text for either.
-const BGS = { "#0d1117": "Night", "#1e1e1e": "Charcoal", "#22201c": "Coffee", "#f6f1e7": "Paper", "#ffffff": "White" };
-const FGS = { "#e6edf3": "Soft white", "#c9d1d9": "Gray", "#f0dfbf": "Cream", "#24292f": "Ink", "#000000": "Black" };
+// Four each, so a row stays one line: the dial (the last swatch) does any other color.
+const BGS = { "#0d1117": "Night", "#1e1e1e": "Charcoal", "#22201c": "Coffee", "#f6f1e7": "Paper" };
+const FGS = { "#e6edf3": "Soft white", "#c9d1d9": "Gray", "#f0dfbf": "Cream", "#24292f": "Ink" };
+const ACCENTS = { "#d97757": "Claude", "#4f8cff": "Blue", "#3fb950": "Green", "#a371f7": "Purple" };
+// An accent saved by name (until 2026-11-17 it was one of these keys, never a hex).
+const ACCENT_NAMES = { claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
 // A bg saved as a theme surface ("chrome", "canvas": pills dropped 2026-11-17) reads as the theme's.
+// accent, bg and fg come out as "theme" or a "#rrggbb".
 const chatLook = () => {
   const look = { ...LOOK_DEFAULT, ...(shared(LOOK) ?? {}) };
-  return HEX.test(look.bg) ? look : { ...look, bg: "theme" };
+  look.accent = ACCENT_NAMES[look.accent] ?? look.accent;
+  for (const key of ["accent", "bg", "fg"]) if (!HEX.test(look[key])) look[key] = "theme";
+  return look;
 };
+// The color dial's math: h 0–360, s and l 0–100.
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => {
+    const k = (n + h / 30) % 12;
+    return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+function hexToHsl(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  if (!d) return [0, 0, Math.round(l * 100)];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const h = max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [Math.round(h * 60), Math.round(s * 100), Math.round(l * 100)];
+}
 const GLOBAL = ["fg", "bg", "accent"];
 const setLook = (change) => {
   setShared(LOOK, change ? { ...chatLook(), ...change } : null);
   if (!change || GLOBAL.some((key) => key in change)) syncColors();
 };
-// null = the theme's own accent.
-const ACCENTS = { theme: null, claude: "#d97757", blue: "#4f8cff", green: "#3fb950", purple: "#a371f7", pink: "#f778ba" };
 const mix = (a, b, k) => "#" + [1, 3, 5].map((i) =>
   Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - k) + parseInt(b.slice(i, i + 2), 16) * k).toString(16).padStart(2, "0")).join("");
 // The picked colors are the whole app's, not just the chat's (a purple chat beside a black
@@ -63,7 +88,7 @@ const isDark = (color) => [1, 3, 5].reduce((n, i, j) => n + parseInt(color.slice
 function lookColors(look) {
   const out = {};
   if (HEX.test(look.fg)) out.foreground = look.fg;
-  if (ACCENTS[look.accent]) out.accent = ACCENTS[look.accent];
+  if (HEX.test(look.accent)) out.accent = look.accent;
   if (HEX.test(look.bg)) {
     const bg = look.bg.toLowerCase();
     const dark = isDark(bg);
@@ -180,7 +205,7 @@ const GAPS = { tight: 6, normal: 10, roomy: 16 };
 function chatTheme() {
   const t = theme();
   const look = chatLook();
-  const out = { ...t, accent: ACCENTS[look.accent] ?? t.accent, background: HEX.test(look.bg) ? look.bg : t.background };
+  const out = { ...t, accent: HEX.test(look.accent) ? look.accent : t.accent, background: HEX.test(look.bg) ? look.bg : t.background };
   // A chosen text color also makes the secondary text: the same color, fainter.
   if (HEX.test(look.fg)) Object.assign(out, { foreground: look.fg, muted: look.fg + "d9", dim: look.fg + "99" });
   return out;
@@ -698,13 +723,36 @@ export default class ClaudeChat extends View {
       // Hex boxes for any background or text color; a full #rrggbb takes effect as it's typed.
       const look = chatLook();
       this.hex = {};
-      for (const key of ["bg", "fg"]) {
+      for (const key of ["accent", "bg", "fg"]) {
         const s = InputState.new({ placeholder: "#hex", value: HEX.test(look[key]) ? look[key] : "" });
-        s.on("change", () => {
+        s.on("change", (_v, cx) => {
           const v = s.value().trim().replace(/^#?/, "#");
-          if (HEX.test(v) && v.toLowerCase() !== String(chatLook()[key]).toLowerCase()) setLook({ [key]: v });
+          if (!HEX.test(v) || v.toLowerCase() === String(chatLook()[key]).toLowerCase()) return;
+          setLook({ [key]: v });
+          if (this.dial === key) { this.loadDial(v); cx?.notify(); }
         });
         this.hex[key] = s;
+      }
+      // The color dial (one, under whichever color row opened it: `dial` = "accent" | "bg" | "fg"):
+      // hue, saturation and lightness sliders. A drag only redraws the preview; letting go saves,
+      // since a save rewrites settings.json and recolors all of Herdr. The sliders hold the color
+      // while it's open (read back from the hex, a gray would lose its hue and the knob would jump).
+      this.dial = null;
+      this.hsl = {};
+      for (const [part, max] of [["h", 360], ["s", 100], ["l", 100]]) {
+        const s = SliderState.new({ min: 0, max, step: 1, value: 0 });
+        let shown = 0;
+        s.on("change", (v, cx) => { if (v !== shown) { shown = v; cx.notify(); } });
+        s.on("release", (_v, cx) => {
+          // set_value (loadDial) is not a pick.
+          if (!this.dial || this.loading || this.dialAt() === this.loaded) return;
+          const color = this.dialColor();
+          this.loaded = this.dialAt();
+          setLook({ [this.dial]: color });
+          this.hex[this.dial].set_value(color);
+          cx.notify();
+        });
+        this.hsl[part] = s;
       }
       // null while programs.json is read; "error" if it isn't valid JSON (left alone then).
       this.dev = null;
@@ -2214,6 +2262,22 @@ export default class ClaudeChat extends View {
     });
   }
 
+  // The color dial: where it starts for a color (the picked one, else the theme's), putting a
+  // color on its sliders, and the sliders' color.
+  dialStart(key) {
+    const now = chatLook()[key];
+    const own = String(theme()[{ accent: "accent", bg: "background", fg: "foreground" }[key]] ?? "");
+    return HEX.test(now) ? now : /^#[0-9a-f]{6}/i.test(own) ? own.slice(0, 7) : "#808080";
+  }
+  loadDial(color) {
+    this.loading = true;
+    hexToHsl(color).forEach((v, i) => this.hsl["hsl"[i]].set_value(v));
+    this.loading = false;
+    this.loaded = this.dialAt();
+  }
+  dialAt() { return ["h", "s", "l"].map((part) => this.hsl[part].value()).join(","); }
+  dialColor() { return hslToHex(...["h", "s", "l"].map((part) => this.hsl[part].value())); }
+
   // The ⚙ popup: the chat's look (see LOOK). Every chat follows it at once.
   settingsMenu(t) {
     const look = chatLook();
@@ -2230,33 +2294,72 @@ export default class ClaudeChat extends View {
       .text_color(t.foreground).hover((s) => s.bg(t.hover))
       .on_click(() => setLook({ size: Math.max(10, Math.min(22, look.size + by)) }))
       .child(label);
-    // Swatches (a ring on the chosen one) and a hex box for any other color.
-    const colors = (key, choices) => h_flex().flex_none().gap(6).items_center()
-      .children(Object.entries(choices).map(([value, name]) => div().id(`look-${key}-${value}`).size(18).rounded(9).cursor_pointer()
-        .bg(value !== "theme" ? value : key === "fg" ? theme().foreground : "#00000000")
-        .border(2).border_color(String(look[key]).toLowerCase() === value ? t.accent : t.border)
-        .tooltip(name)
-        .on_click(() => { setLook({ [key]: value }); this.hex[key].set_value(HEX.test(value) ? value : ""); })))
-      .child(div().w(76).h(24).px(6).flex().items_center().rounded(5).border(1).border_color(t.border).bg(t.surface)
-        .text_size(12).text_color(t.foreground).child(Input.new(this.hex[key])));
+    // A color: its name and a hex box, then a line of swatches (a ring on the chosen one; the
+    // first is the theme's own) ending in the rainbow one, which opens the dial under them.
+    const ring = (key) => (key === "accent" ? t.foreground : t.accent);
+    const strip = (cells) => cells.map((color) => div().flex_1().h_full().bg(color));
+    const slide = (part, label, cells) => {
+      const s = this.hsl[part];
+      return h_flex().gap(8).items_center()
+        .child(div().w(10).flex_none().text_size(11).text_color(t.dim).child(label))
+        .child(Slider.new(s).flex_1().min_w(0).child(SliderTrack.new(s).flex().items_center().h(18).w_full().cursor_pointer().child(
+          SliderIndicator.new(s).relative().flex().w_full().h(8)
+            .range_style((fill) => fill.bg("#00000000"))
+            .children(strip(cells))
+            .child(SliderThumb.new(s).size(12).rounded(6).bg("#ffffff").border(1).border_color("#000000").ml(-6).mt(-2)))));
+    };
+    const dial = () => {
+      const [h, s, l] = ["h", "s", "l"].map((part) => this.hsl[part].value());
+      const steps = [...Array(21).keys()].map((i) => i * 5);
+      return h_flex().mt(2).p(8).gap(10).rounded(6).bg(t.surface).border(1).border_color(t.border)
+        .child(v_flex().flex_none().gap(4).items_center()
+          .child(div().w(34).h(34).rounded(6).bg(this.dialColor()).border(1).border_color(t.border))
+          .child(div().text_size(10).text_color(t.dim).child(this.dialColor())))
+        .child(v_flex().flex_1().min_w(0).gap(2)
+          .child(slide("h", "H", [...Array(36).keys()].map((i) => hslToHex(i * 10 + 5, 100, 50))))
+          .child(slide("s", "S", steps.map((v) => hslToHex(h, v, l))))
+          .child(slide("l", "L", steps.map((v) => hslToHex(h, s, v)))));
+    };
+    const colors = (key, label, choices) => v_flex()
+      .child(row(label, h_flex().flex_none().gap(6).items_center()
+        .children(Object.entries({ theme: "Theme's", ...choices }).map(([value, name]) => div().id(`look-${key}-${value}`).size(18).rounded(9).cursor_pointer()
+          .bg(value !== "theme" ? value : key === "bg" ? "#00000000" : theme()[key === "fg" ? "foreground" : "accent"])
+          .border(2).border_color(look[key].toLowerCase() === value ? ring(key) : t.border)
+          .tooltip(name)
+          .on_click((_e, cx) => {
+            setLook({ [key]: value });
+            this.hex[key].set_value(HEX.test(value) ? value : "");
+            if (this.dial === key) this.loadDial(this.dialStart(key));
+            cx.notify();
+          })))
+        // Three dots in a ring: cells clipped to the circle drew as a square (overflow_hidden
+        // doesn't follow the rounding; the user's screenshot 2026-11-17).
+        .child(h_flex().id(`look-${key}-dial`).size(18).rounded(9).gap(1).items_center().justify_center().cursor_pointer()
+          .border(2).border_color(this.dial === key ? ring(key) : t.border)
+          .tooltip("Any color: hue, saturation, lightness")
+          .on_click((_e, cx) => {
+            this.dial = this.dial === key ? null : key;
+            if (this.dial) this.loadDial(this.dialStart(key));
+            cx.notify();
+          })
+          .children(["#f85149", "#3fb950", "#4f8cff"].map((color) => div().size(4).rounded(2).flex_none().bg(color))))
+        .child(div().w(76).h(24).px(6).flex().items_center().rounded(5).border(1).border_color(t.border).bg(t.surface)
+          .text_size(12).text_color(t.foreground).child(Input.new(this.hex[key])))))
+      .when(this.dial === key, (el) => el.child(div().px(8).pb(4).child(dial())));
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
       .child(h_flex().px(8).pt(4).pb(4).items_center().justify_between()
         .child(div().text_size(11).text_color(t.dim).child("Chat"))
         .child(div().id("look-reset").text_size(11).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-          .on_click(() => { setLook(null); for (const s of Object.values(this.hex)) s.set_value(""); }).child("Reset")))
+          .on_click((_e, cx) => { setLook(null); this.dial = null; for (const s of Object.values(this.hex)) s.set_value(""); cx.notify(); }).child("Reset")))
       .child(row("Text size", pills(step("look-smaller", "A−", -1), div().w(28).text_center().text_color(t.foreground).child(String(look.size)), step("look-bigger", "A+", 1))))
       .child(row("Font", pills(seg("font", "ui", "Sans"), seg("font", "mono", "Mono"))))
       .child(row("Width", pills(seg("width", "full", "Full"), seg("width", "narrow", "Narrow"))))
       .child(row("Tool calls", pills(seg("tools", "show", "Show"), seg("tools", "hide", "Hide"))))
       .child(row("Earlier turns", pills(seg("history", "fold", "Fold"), seg("history", "show", "Show"))))
-      .child(row("Accent (all of Herdr)", h_flex().flex_none().gap(6).children(Object.entries(ACCENTS).map(([key, color]) =>
-        div().id(`look-accent-${key}`).size(18).rounded(9).cursor_pointer().bg(color ?? t.accent)
-          .border(2).border_color(look.accent === key ? t.foreground : "#00000000")
-          .tooltip(key === "theme" ? "Theme's accent" : key[0].toUpperCase() + key.slice(1))
-          .on_click(() => setLook({ accent: key }))))))
       .child(row("Your messages", pills(seg("mine", "box", "Box"), seg("mine", "tint", "Tint"), seg("mine", "bar", "Bar"))))
-      .child(row("Background (all of Herdr)", colors("bg", { theme: "Theme's", ...BGS })))
-      .child(row("Text (all of Herdr)", colors("fg", { theme: "Theme's", ...FGS })))
+      .child(colors("accent", "Accent (all of Herdr)", ACCENTS))
+      .child(colors("bg", "Background (all of Herdr)", BGS))
+      .child(colors("fg", "Text (all of Herdr)", FGS))
       .child(row("Spacing", pills(seg("space", "tight", "Tight"), seg("space", "normal", "Normal"), seg("space", "roomy", "Roomy"))))
       .child(div().px(8).pt(10).pb(4).text_size(11).text_color(t.dim).child("+ menu"))
       .child(row("Claude (dev container)", this.dev === "error"
@@ -2588,7 +2691,7 @@ export default class ClaudeChat extends View {
         .child(div().id("chat-settings").flex_none().p(4).rounded(6).text_color(t.dim).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Chat settings")
-          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 520, props: { settings: true } }))
+          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 600, props: { settings: true } }))
           .child(svg("mods/workspace-chrome/settings.svg").size(14)))
         .child(props()?.stack ? viewSwitch(t, "chat", () => this.toTerminal(agent.address))
           : this.button(t, "terminal", "Terminal", () => this.toTerminal(agent.address))))
