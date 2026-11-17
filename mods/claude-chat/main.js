@@ -10,13 +10,13 @@ import { v_flex, h_flex, TextView, TextareaState, Textarea, InputState, Input, P
 import { readFile, readdir, exists, writeFile } from "fs/promises";
 import os from "os";
 import { Buffer } from "buffer";
-import { agents, terminals, panes, focused, props, layout, hc, exec, home, run, theme, settings, watchFolder, shared, setShared, openOverlay, appHome, readTextFile, writeTextFile } from "herdr";
+import { agents, terminals, panes, focused, props, layout, hc, exec, home, run, theme, settings, watchFolder, shared, setShared, openOverlay, appHome, readTextFile, writeTextFile, fonts } from "herdr";
 import COMMANDS from "./commands.js";
 import * as ask from "./question.js";
 
 const CLAUDE = `${home()}/.claude`;
 // The chat's look, shared by every copy and kept across restarts; the ⚙ popup changes it.
-// size: the message text in px (the rest scales with it); font: "ui" or "mono" (the terminals');
+// size: the message text in px (the rest scales with it); font: "ui", "mono" (the terminals') or a family on this computer;
 // width: "full" or "narrow" (a readable column); tools: "show" or "hide" the tool-call rows;
 // accent: a key of ACCENTS; mine (your messages): "box", "tint" or "bar"; bg: the color
 // behind the messages, "theme" or a "#rrggbb"; fg: the text color, "theme" or a "#rrggbb" (a picked
@@ -63,6 +63,15 @@ function hexToHsl(hex) {
   const h = max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
   return [Math.round(h * 60), Math.round(s * 100), Math.round(l * 100)];
 }
+// The font families on this computer, for the ⚙ popup's list and for a saved pick: one this
+// computer no longer has (shared state outlives an uninstall) reads as Sans. Asked again once
+// for a name not found, since a font can be installed while Herdr runs.
+let FAMILIES = null, missed = null;
+const hasFont = (name) => {
+  if (!FAMILIES || (!FAMILIES.includes(name) && missed !== name)) { FAMILIES = fonts(); missed = name; }
+  return FAMILIES.includes(name);
+};
+const ownFont = (look) => !["ui", "mono"].includes(look.font) && hasFont(look.font);
 const GLOBAL = ["fg", "bg", "accent"];
 const setLook = (change) => {
   setShared(LOOK, change ? { ...chatLook(), ...change } : null);
@@ -754,6 +763,12 @@ export default class ClaudeChat extends View {
         });
         this.hsl[part] = s;
       }
+      // The font list under the Font row (`fontList`), with a box to narrow it. "@…" families are
+      // Windows' sideways copies for vertical text.
+      this.fontList = false;
+      this.families = [...new Set(fonts())].filter((name) => !/^[@.]/.test(name)).sort((a, b) => a.localeCompare(b));
+      this.fontFind = InputState.new({ placeholder: "Search fonts" });
+      this.fontFind.on("change", (_v, cx) => cx?.notify());
       // null while programs.json is read; "error" if it isn't valid JSON (left alone then).
       this.dev = null;
       cx.spawn(async (cx) => {
@@ -2339,20 +2354,50 @@ export default class ClaudeChat extends View {
           .tooltip("Any color: hue, saturation, lightness")
           .on_click((_e, cx) => {
             this.dial = this.dial === key ? null : key;
-            if (this.dial) this.loadDial(this.dialStart(key));
+            if (this.dial) { this.loadDial(this.dialStart(key)); this.fontList = false; }
             cx.notify();
           })
           .children(["#f85149", "#3fb950", "#4f8cff"].map((color) => div().size(4).rounded(2).flex_none().bg(color))))
         .child(div().w(76).h(24).px(6).flex().items_center().rounded(5).border(1).border_color(t.border).bg(t.surface)
           .text_size(12).text_color(t.foreground).child(Input.new(this.hex[key])))))
       .when(this.dial === key, (el) => el.child(div().px(8).pb(4).child(dial())));
+    // Any font on this computer: the third pill (the picked family's name, else "Other…") opens
+    // a list under the row, each family with a sample in its own face (the name stays in the
+    // popup's font: a symbol font's own name can't be read). At most FONT_ROWS are drawn.
+    const own = ownFont(look);
+    const FONT_ROWS = 60;
+    const fontPill = div().id("look-font-own").px(8).h(22).max_w(130).flex().items_center().gap(4).rounded(5)
+      .text_size(12).cursor_pointer()
+      .when(own, (el) => el.bg(t.selected).text_color(t.foreground))
+      .when(!own, (el) => el.text_color(this.fontList ? t.foreground : t.dim).hover((s) => s.text_color(t.foreground)))
+      .on_click((_e, cx) => { this.fontList = !this.fontList; if (this.fontList) this.dial = null; cx.notify(); })
+      .child(div().min_w(0).truncate().child(own ? look.font : "Other…"))
+      .child(div().flex_none().text_size(9).child(this.fontList ? "▴" : "▾"));
+    const fontList = () => {
+      const find = this.fontFind.value().trim().toLowerCase();
+      const found = this.families.filter((name) => name.toLowerCase().includes(find));
+      return v_flex().mx(8).mb(4).rounded(6).bg(t.surface).border(1).border_color(t.border)
+        .child(div().h(28).px(8).flex().items_center().border_b(1).border_color(t.border)
+          .text_size(12).text_color(t.foreground).child(Input.new(this.fontFind)))
+        .child(v_flex().id("look-fonts").flex_none().h(150).p(2).overflow_y_scrollbar()
+          .children(found.slice(0, FONT_ROWS).map((name, i) => h_flex().id(`look-font-${i}`).flex_none().h(24).px(6).gap(8).items_center().rounded(4).cursor_pointer()
+            .when(look.font === name, (el) => el.bg(t.selected))
+            .hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => { setLook({ font: name }); cx.notify(); })
+            .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(name))
+            .child(div().flex_none().font_family(name).text_size(13).text_color(t.muted).child("Hello 123"))))
+          .when(found.length > FONT_ROWS, (el) => el.child(div().flex_none().h(24).px(6).flex().items_center().text_size(11).text_color(t.dim)
+            .child(`${found.length - FONT_ROWS} more: type to narrow`)))
+          .when(!found.length, (el) => el.child(div().h(24).px(6).flex().items_center().text_size(11).text_color(t.dim).child("No font by that name"))));
+    };
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
       .child(h_flex().px(8).pt(4).pb(4).items_center().justify_between()
         .child(div().text_size(11).text_color(t.dim).child("Chat"))
         .child(div().id("look-reset").text_size(11).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
-          .on_click((_e, cx) => { setLook(null); this.dial = null; for (const s of Object.values(this.hex)) s.set_value(""); cx.notify(); }).child("Reset")))
+          .on_click((_e, cx) => { setLook(null); this.dial = null; this.fontList = false; for (const s of Object.values(this.hex)) s.set_value(""); cx.notify(); }).child("Reset")))
       .child(row("Text size", pills(step("look-smaller", "A−", -1), div().w(28).text_center().text_color(t.foreground).child(String(look.size)), step("look-bigger", "A+", 1))))
-      .child(row("Font", pills(seg("font", "ui", "Sans"), seg("font", "mono", "Mono"))))
+      .child(row("Font", pills(seg("font", "ui", "Sans"), seg("font", "mono", "Mono"), fontPill)))
+      .when(this.fontList, (el) => el.child(fontList()))
       .child(row("Width", pills(seg("width", "full", "Full"), seg("width", "narrow", "Narrow"))))
       .child(row("Tool calls", pills(seg("tools", "show", "Show"), seg("tools", "hide", "Hide"))))
       .child(row("Earlier turns", pills(seg("history", "fold", "Fold"), seg("history", "show", "Show"))))
@@ -2605,7 +2650,8 @@ export default class ClaudeChat extends View {
     const look = chatLook();
     const root = v_flex().size_full().min_h(0).bg(t.background).text_size(px(13));
     // The chosen font goes to the messages and the box, not the header.
-    const font = (el) => el.when(look.font === "mono", (el) => el.font_family(this.mono()));
+    const family = look.font === "mono" ? this.mono() : ownFont(look) ? look.font : null;
+    const font = (el) => el.when(Boolean(family), (el) => el.font_family(family));
     // Both flips happen now rather than on the next 2 s tick: a tab with no Claude goes to the
     // Terminal, and a tab with one comes back to the chat when the chat itself flipped the stack
     // away (going from a shell tab to a Claude tab showed its terminal for up to 2 s, then the
@@ -2691,7 +2737,7 @@ export default class ClaudeChat extends View {
         .child(div().id("chat-settings").flex_none().p(4).rounded(6).text_color(t.dim).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Chat settings")
-          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 600, props: { settings: true } }))
+          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 640, props: { settings: true } }))
           .child(svg("mods/workspace-chrome/settings.svg").size(14)))
         .child(props()?.stack ? viewSwitch(t, "chat", () => this.toTerminal(agent.address))
           : this.button(t, "terminal", "Terminal", () => this.toTerminal(agent.address))))
