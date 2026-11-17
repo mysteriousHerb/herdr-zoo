@@ -4,8 +4,31 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props, knownAgents } from "herdr";
+import { spaces, panes, agents, terminals, focused, run, openOverlay, theme, window, shared, setShared, layout, settings, props, knownAgents, nextCommand, exec } from "herdr";
 import PACKS from "./sprites.js";
+
+// The Chat / Terminal stack is one per layout, so a shell tab shows the Terminal side and a
+// Claude tab the chat (claude-chat's autoView). Done there, the flip came a frame after the tab
+// drew: a twitch on every switch (the user's report 2026-11-17). So a tab click flips the stack
+// first, by the tab it is going to; shared chat.views names the stack and chat.flipped whether
+// the Terminal side is the chat's own doing (a Terminal picked by hand stays).
+function preflip(tab) {
+  const views = shared("chat.views");
+  if (!views || tab == null) return;
+  const hasClaude = agents().some((a) => a.app === "claude-code" && a.tab === tab)
+    || panes().some((p) => p.tab === tab && p.terminal && /^claude/.test(p.program?.key ?? ""));
+  const find = (node) => (node?.id === views.stack ? node : (node?.children ?? []).map(find).find(Boolean));
+  const node = find(layout());
+  const active = node?.active ?? node?.children?.[0]?.id;
+  if (!hasClaude && active === views.self) {
+    setShared("chat.flipped", true);
+    run("layout.select", { stack: views.stack, child: views.other });
+  } else if (hasClaude && active === views.other && shared("chat.flipped")) {
+    setShared("chat.flipped", false);
+    run("layout.select", { stack: views.stack, child: views.self });
+  }
+}
+
 
 // Every sprite by key "<pack>/<id>" (sprites.js, the zoo's catalog; scripts/make_packs.py).
 const BY = new Map(PACKS.flatMap((p) => p.sprites.map((s) => [`${p.id}/${s.id}`, { ...s, pack: p }])));
@@ -90,6 +113,19 @@ function find(node, id) {
 
 export default class Tabs extends View {
   init(_props, cx) {
+    // Ctrl+C in a terminal (keys.json: "terminal": { "ctrl-c": "my-tabs.copy" }, the user's ask
+    // 2026-11-17): with a selection it copies, like an editor; else it is the program's interrupt,
+    // sent by hc (a mod has no key to send). This mod gets it because it is in every layout.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        if (c !== "copy") continue;
+        const f = focused();
+        if (!f?.terminal) continue;
+        if (f.selection) { run("terminal.copy"); run("terminal.clear_selection"); }
+        else exec("hc", ["keys", f.terminal, "ctrl+c"]).catch(() => {});
+      }
+    });
     this.pressed = null;
     loadLaunchers(cx);
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
@@ -166,7 +202,7 @@ export default class Tabs extends View {
         .on_mouse_up("left", () => {
           const from = this.pressed; this.pressed = null;
           if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex(x => x.id === c.id) + 1 });
-          else run("tab.select", { id: c.id });
+          else { preflip(c.id); run("tab.select", { id: c.id }); }
         })
         .on_mouse_down("right", () => {
           const mine = agents().filter(a => a.tab === c.id);
