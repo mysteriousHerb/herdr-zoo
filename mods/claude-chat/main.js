@@ -499,7 +499,9 @@ function promptText(screen) {
   lines.forEach((l, i) => { if (/^\s*─{20,}\s*$/.test(l)) rules.push(i); });
   if (rules.length < 2) return "";
   const [a, b] = rules.slice(-2);
-  return lines.slice(a + 1, b).map((l) => l.replace(/^\s*❯?\s?/, "")).join("\n").trim();
+  const text = lines.slice(a + 1, b).map((l) => l.replace(/^\s*❯?\s?/, "")).join("\n").trim();
+  // A fresh session's empty prompt shows a hint, `Try "fix typecheck errors"` (2.1.326): empty.
+  return /^Try "[^"\n]*"$/.test(text) ? "" : text;
 }
 
 const plainMarkdown = (s) => s.replace(/\r/g, "").split(/\n\s*\n/)
@@ -955,6 +957,11 @@ export default class ClaudeChat extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       const screen = async () => (await hc(["read", address])).stdout.replace(/\r/g, "");
+      // Text left in the prompt (a stopped turn's queue) would take the command: into the box first.
+      if (promptText(await screen())) {
+        const taken = await this.reclaimPrompt(address, cx).catch(() => null);
+        if (taken === null) { this.pending = null; this.pickNote = "Claude's prompt holds text: send or clear it in the Terminal first"; return cx.notify(); }
+      }
       // Types the command, waits for its picker (`ready` tests the screen), then `keys`.
       const inPicker = async (command, ready, what) => {
         await hc(["keys", address, ...command.split("")]);
@@ -1927,6 +1934,46 @@ export default class ClaudeChat extends View {
     return kept;
   }
 
+  // Empties Claude's prompt, which holds `held` (read off the screen), a line at a time: ctrl+u
+  // (clears the cursor's line; the cursor is at the end) then backspace (joins the line above),
+  // until the screen shows it empty. What is left, "" when it worked.
+  async emptyPrompt(t, held, cx, log = []) {
+    const prompt = async () => promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+    let left = held;
+    for (let i = 0; i < 6 && left; i++) {
+      const lines = left.split("\n").length + 1;
+      await hc(["keys", t, ...Array.from({ length: lines }, () => ["ctrl+u", "backspace"]).flat()]);
+      await cx.sleep(300);
+      left = await prompt();
+      log.push(`cleared ${i}: ${JSON.stringify(left.slice(0, 80))}`);
+    }
+    return left;
+  }
+
+  // Text left in Claude's prompt (Esc on a turn gives the queued messages back to the prompt,
+  // where the chat didn't show them and the next /model or /effort would have typed into them;
+  // the user's report 2026-11-17) goes into the chat's box instead: the prompt is emptied and the
+  // text put under whatever the box holds. The queued messages' own texts are used when the
+  // screen shows exactly them (the screen wraps long lines, and folds a long paste to
+  // "[Pasted text #1 +19 lines]"). Returns the text taken, or null.
+  async reclaimPrompt(t, cx) {
+    const held = promptText((await hc(["read", t]).catch(() => null))?.stdout ?? "");
+    if (!held || QUEUE_HINT.test(held)) return null;
+    const squash = (x) => x.replace(/\s+/g, "");
+    const queued = (this.queues?.get(t) ?? []).map((q) => q.text);
+    const text = queued.length && (squash(held) === squash(queued.join("")) || /\[Pasted text #\d+/.test(held)) ? queued.join("\n\n") : held;
+    if (await this.emptyPrompt(t, held, cx)) return null;
+    if (this.queues?.get(t)) this.queues.set(t, []);
+    if (this.address === t) {
+      const had = this.box.value();
+      this.box.set_value(had.trim() ? `${had.replace(/\s+$/, "")}\n\n${text}` : text);
+      this.typed = this.box.value();
+      this.box.focus();
+      cx.notify();
+    }
+    return text;
+  }
+
   // Up in Claude's empty prompt takes every queued message back into the prompt (one popAll line
   // each, joined by line breaks). The prompt is then emptied a line at a time, ctrl+u (clears
   // the cursor's line; the cursor is at the end) then backspace (joins the line above), until
@@ -1959,14 +2006,7 @@ export default class ClaudeChat extends View {
       log.push(`read ${i}: ${JSON.stringify(held.slice(0, 80))}`);
     }
     if (QUEUE_HINT.test(held)) return done("Claude's terminal didn't give its queued messages back: nothing changed.");
-    let left = held;
-    for (let i = 0; i < 6 && left; i++) {
-      const lines = left.split("\n").length + 1;
-      await hc(["keys", t, ...Array.from({ length: lines }, () => ["ctrl+u", "backspace"]).flat()]);
-      await cx.sleep(300);
-      left = await prompt();
-      log.push(`cleared ${i}: ${JSON.stringify(left.slice(0, 80))}`);
-    }
+    const left = await this.emptyPrompt(t, held, cx, log);
     if (left) return done("Couldn't empty Claude's prompt: the queued messages are in it, in its terminal.");
     // The screen wraps long lines, so compare without spaces.
     const squash = (x) => x.replace(/\s+/g, "");
@@ -2156,7 +2196,15 @@ export default class ClaudeChat extends View {
   // and a second one quits it.
   stop(cx) {
     const address = this.address;
-    cx.spawn(async () => { await hc(["keys", address, "esc"]); });
+    cx.spawn(async (cx) => {
+      await hc(["keys", address, "esc"]);
+      // Claude gives queued messages back to its prompt on the interrupt: into the box.
+      for (let i = 0; i < 8; i++) {
+        await cx.sleep(400);
+        if (agents().find((a) => a.address === address)?.status !== "working") break;
+      }
+      await this.reclaimPrompt(address, cx).catch(() => {});
+    });
     cx.timer.after(3000, (cx) => {
       const still = agents().find((a) => a.address === address)?.status === "working";
       if (!still || this.address !== address) return;
