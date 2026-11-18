@@ -152,7 +152,7 @@ export function card(view, t, px) {
   if (shown.at === questions.length) {
     return box
       .child(div().text_size(px(14)).font_semibold().text_color(t.foreground).child("Send these answers?"))
-      .child(v_flex().gap(6).children(shown.review.map((r, i) => v_flex().id(`ask-review-${i}`).gap(2)
+      .child(v_flex().id("ask-review").gap(6).max_h(view.cardMax()).overflow_y_scrollbar().children(shown.review.map((r, i) => v_flex().id(`ask-review-${i}`).gap(2)
         .child(div().text_size(px(12)).text_color(t.muted).child(r.q))
         .child(div().text_color(t.foreground).font_medium().child(`→ ${r.a || "(no answer)"}`)))))
       .child(h_flex().gap(6)
@@ -185,13 +185,16 @@ export function card(view, t, px) {
 
   // Markdown, as Claude writes it: the context regular, the question itself bold.
   const { context, question } = parts(q.question);
+  // The question and its options scroll when they'd be taller than the chat has room for; the
+  // card's head and buttons stay in view.
   return box
-    .when(Boolean(context), (el) => el.child(div().text_color(t.muted)
-      .child(TextView.markdown(`ask-context-${shown.at}`, context).selectable(true))))
-    .child(div().text_size(px(14)).font_semibold().text_color(t.foreground)
-      .child(TextView.markdown(`ask-question-${shown.at}`, question).selectable(true)))
-    .when(multi, (el) => el.child(div().text_size(px(11.5)).text_color(t.dim).child("Pick any, then Next.")))
-    .child(v_flex().gap(6).children(options))
+    .child(v_flex().id(`ask-body-${shown.at}`).gap(10).max_h(view.cardMax()).overflow_y_scrollbar()
+      .when(Boolean(context), (el) => el.child(div().text_color(t.muted)
+        .child(TextView.markdown(`ask-context-${shown.at}`, context).selectable(true))))
+      .child(div().text_size(px(14)).font_semibold().text_color(t.foreground)
+        .child(TextView.markdown(`ask-question-${shown.at}`, question).selectable(true)))
+      .when(multi, (el) => el.child(div().text_size(px(11.5)).text_color(t.dim).child("Pick any, then Next.")))
+      .child(v_flex().gap(6).children(options)))
     .when(multi, (el) => el.child(h_flex().child(view.button(t, "ask-next", many ? "Next" : "Submit",
       press(view, moves(shown.cursor, q.options.length + 2)), true))))
     .child(foot("Or type your own answer below and press Enter."));
