@@ -19,6 +19,8 @@ import { spaces, agents, panes, focused, theme, run, window, shared, setShared, 
 const WIN = /^win/.test(os.platform()); // "windows" here, not node's "win32"
 // claude-chat shares which container each Claude runs in: { "<address>": "<container id or name>" }.
 const CONTAINERS = "chat.containers";
+// How full each Claude agent's context is, from claude-chat: { "<address>": { tokens, model } }.
+const CONTEXT = "chat.context";
 // The repo each dev container workspace shows on the bar, picked in the repos list:
 // { "<workspace root, lowercase>": "<repo folder>" }. Unset = the focused terminal's repo.
 const SHOWN = "status.shownRepo";
@@ -283,6 +285,12 @@ function limitName(key) {
   return key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 }
 
+// Each model's context window in tokens, saved by statusline.cjs: { "<model id>": tokens } | null.
+async function readWindowsFile() {
+  try { return JSON.parse(await readFile(`${USAGE_DIR()}/windows.json`, "utf8")); } catch { return null; }
+}
+const tokensText = (n) => (n >= 999500 ? `${(n / 1e6).toFixed(n >= 9950000 ? 0 : 1).replace(/\.0$/, "")}M` : `${Math.max(1, Math.round(n / 1000))}k`);
+
 // Each window: { key, name, short, pct, resets (ms) | null, reset (true once resets has passed:
 // the saved % is then the old window's, so it shows 0), spend ("$x / $y …") }.
 function usageWindows(usage) {
@@ -357,7 +365,12 @@ export default class WorkspaceStatus extends View {
       const s = JSON.stringify(usageWindows(this.usage).map((w) => [w.key, w.pct, w.reset, w.resets, w.spend]));
       if (s !== this.usageSig) { this.usageSig = s; cx.notify(); }
     };
-    const read = (cx) => cx.spawn(async (cx) => { this.usage = await readUsageFile(); check(cx); });
+    const read = (cx) => cx.spawn(async (cx) => {
+      this.usage = await readUsageFile();
+      const windows = await readWindowsFile();
+      if (JSON.stringify(windows) !== JSON.stringify(this.windows)) { this.windows = windows; cx.notify(); }
+      check(cx);
+    });
     read(cx);
     if (watch) {
       cx.spawn(async (cx) => {
@@ -371,8 +384,22 @@ export default class WorkspaceStatus extends View {
     } else cx.timer.every(5000, (cx) => { read(cx); cx.notify(); });
   }
 
+  // The focused agent's context: { tokens, size, pct, name } (size and pct null when no local
+  // Claude has reported that model's window yet), else null. Only an agent of the shown space:
+  // focused().agent is the last one shown, maybe another space's.
+  contextNow() {
+    const space = spaces().find((s) => s.active);
+    const fa = focused()?.agent;
+    const agent = fa ? agents().find((a) => a.address === fa && (!space || a.space === space.id)) : null;
+    const c = agent ? (shared(CONTEXT) ?? {})[fa] : null;
+    if (!(typeof c?.tokens === "number" && c.tokens > 0)) return null;
+    const size = typeof this.windows?.[c.model] === "number" ? this.windows[c.model] : null;
+    const pct = size !== null && size >= c.tokens ? Math.round((c.tokens / size) * 100) : null;
+    return { tokens: c.tokens, size: pct === null ? null : size, pct, name: agent.title || agent.address };
+  }
+
   openUsage(anchor) {
-    const n = Math.max(1, usageWindows(this.usage).length);
+    const n = Math.max(1, usageWindows(this.usage).length) + (this.contextNow() ? 1 : 0);
     const height = 34 + n * 58 + 30 + 10;
     openOverlay({
       mod: "my-status", kind: "popup", width: USAGE_POPUP_W, height,
@@ -384,13 +411,25 @@ export default class WorkspaceStatus extends View {
   // Each limit: name, % used, a bar, when it resets; then how fresh the numbers are.
   usagePopup(t) {
     const uw = usageWindows(this.usage);
+    const cw = this.contextNow();
     const W = USAGE_POPUP_W - 10 - 16; // the bar's width: the popup less its padding
     const tone = (pct) => (pct >= 90 ? t.blocked : t.accent);
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
       .child(h_flex().h(30).flex_none().px(8).items_center().text_size(11).text_color(t.dim)
-        .child(div().flex_1().child("Plan usage"))
+        .child(div().flex_1().child(cw ? "Context and plan usage" : "Plan usage"))
         .child(div().id("usage-page").cursor_pointer().hover(s => s.text_color(t.foreground)).tooltip("Open claude.ai's usage page")
           .on_click((_e, cx) => cx.open_url("https://claude.ai/settings/usage")).child("claude.ai ›")))
+      // The focused agent's context first: its name, a bar when the window is known.
+      .when(Boolean(cw), el => el.child(v_flex().h(58).flex_none().px(8).py(6).gap(6)
+        .child(h_flex().items_center().gap(8)
+          .child(div().flex_none().text_color(t.foreground).child("Context"))
+          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(cw.name))
+          .child(div().flex_none().text_color((cw.pct ?? 0) >= 80 ? t.blocked : t.muted).child(cw.pct === null ? `${tokensText(cw.tokens)} tokens` : `${cw.pct}% used`)))
+        .child(div().h(6).w(W).flex_none().rounded(3).bg(t.hover)
+          .when(cw.pct !== null, el => el.child(div().h(6).w(Math.round((W * (cw.pct ?? 0)) / 100)).rounded(3).bg((cw.pct ?? 0) >= 80 ? t.blocked : t.accent))))
+        .child(div().text_size(11).text_color(t.dim).child(cw.pct === null
+          ? "As of Claude's last reply · window unknown until a Claude here runs this model"
+          : `${tokensText(cw.tokens)} of ${tokensText(cw.size)} tokens, as of Claude's last reply`))))
       .when(!uw.length, el => el.child(div().h(58).px(8).flex().items_center().text_color(t.muted)
         .child("No usage yet: it comes from a running Claude's status line.")))
       .children(uw.map((w) => v_flex().h(58).flex_none().px(8).py(6).gap(6)
@@ -774,6 +813,13 @@ export default class WorkspaceStatus extends View {
       this.usage?.at ? `Updated ${ago(this.usage.at)}` : null, "Click: details"].filter(Boolean).join("\n");
     const space = spaces().find(s => s.active);
     const list = agents();
+    // One item for the focused agent's context and the plan's limits: "ctx 20% · 5h 12% · wk 78%"
+    // (one button since 2026-11-18, the user's call); click = the popup with each of them.
+    const cw = this.contextNow();
+    const ctxText = cw ? `ctx ${cw.pct === null ? tokensText(cw.tokens) : `${cw.pct}%`}` : "";
+    const meterText = [ctxText, usageText].filter(Boolean).join(" · ");
+    const meterTip = [cw ? `Context: ${tokensText(cw.tokens)}${cw.pct === null ? "" : ` of ${tokensText(cw.size)} (${cw.pct}%)`} tokens, as of Claude's last reply` : null,
+      usageTip].filter(Boolean).join("\n");
     const label = (icon, text) => h_flex().gap(6).items_center().child(svg(`mods/workspace-chrome/${icon}.svg`).size(13)).child(text);
     const folder = space && !space.machine ? (focused()?.cwd || space.folder) : "";
     const button = (id, icon, text, what) => label(icon, text).id(id).cursor_pointer().hover(s => s.text_color(t.foreground))
@@ -837,9 +883,9 @@ export default class WorkspaceStatus extends View {
         .tooltip(`${pr.title} (${prState}) · open`)
         .on_click((_e, cx) => cx.open_url(pr.url))))
       .child(div().flex_1())
-      .when(Boolean(usageText), el => el.child(label("clock", usageText).id("usage").cursor_pointer()
-        .when(uw.some((w) => w.pct >= 90), s => s.text_color(t.blocked))
-        .hover(s => s.text_color(t.foreground)).tooltip(usageTip)
+      .when(Boolean(meterText), el => el.child(label("clock", meterText).id("usage").cursor_pointer()
+        .when(uw.some((w) => w.pct >= 90) || (cw?.pct ?? 0) >= 80, s => s.text_color(t.blocked))
+        .hover(s => s.text_color(t.foreground)).tooltip(meterTip)
         .on_mouse_down("left", (e) => this.openUsage({ x: e.position.x, y: e.position.y - (e.local_position?.y ?? 8) - 8 }))))
       .child(div().id("palette").text_color(t.dim).on_click(() => run("app.palette")).child(`${window()?.platform === "macos" ? "⌘" : "Ctrl"} Shift P  commands`))
       // The machine, last: rarely looked at (the user's call 2026-11-01).

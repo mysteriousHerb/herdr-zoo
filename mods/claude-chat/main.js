@@ -66,6 +66,9 @@ function hexToHsl(hex) {
 // The font families on this computer, for the ⚙ popup's list and for a saved pick: one this
 // computer no longer has (shared state outlives an uninstall) reads as Sans. Asked again once
 // for a name not found, since a font can be installed while Herdr runs.
+// The ⚙ popup's font list draws this many rows, and as many again each time the wheel turns down
+// over it (so the rows are there before the scroll reaches them); a new search starts over.
+const FONT_PAGE = 40;
 let FAMILIES = null, missed = null;
 const hasFont = (name) => {
   if (!FAMILIES || (!FAMILIES.includes(name) && missed !== name)) { FAMILIES = fonts(); missed = name; }
@@ -310,6 +313,7 @@ const sameSlash = (a, b) => Boolean(a && b) && a.start === b.start && a.q === b.
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 // Shared: how many sub-agents each Claude agent has at work, { "<address>": n }, for my-status.
 const SUBS = "chat.subs";
+const CONTEXT = "chat.context";
 const CONTAINERS = "chat.containers"; // { "<address>": "<container>" }, for my-status
 // A sub-agent still at work: its meta doesn't say finished, and a foreground one's call isn't
 // answered yet (an interrupted one's meta may never say finished).
@@ -768,7 +772,8 @@ export default class ClaudeChat extends View {
       this.fontList = false;
       this.families = [...new Set(fonts())].filter((name) => !/^[@.]/.test(name)).sort((a, b) => a.localeCompare(b));
       this.fontFind = InputState.new({ placeholder: "Search fonts" });
-      this.fontFind.on("change", (_v, cx) => cx?.notify());
+      this.fontFind.on("change", (_v, cx) => { this.fontMax = FONT_PAGE; cx?.notify(); });
+      this.fontMax = FONT_PAGE;
       // null while programs.json is read; "error" if it isn't valid JSON (left alone then).
       this.dev = null;
       cx.spawn(async (cx) => {
@@ -855,7 +860,7 @@ export default class ClaudeChat extends View {
   reset(address) {
     if (this.address) this.cache.set(this.address, { where: this.where, session: this.session, file: this.file,
       pos: this.pos, items: this.items, tools: this.tools, skills: this.skills, subs: this.subs, looked: this.looked, lastReply: this.lastReply,
-      model: this.model, effort: this.effort });
+      model: this.model, effort: this.effort, fill: this.fill });
     this.address = address;
     const kept = this.cache.get(address) ?? {};
     this.where = kept.where ?? null; this.session = kept.session ?? null; this.file = kept.file ?? null; this.pos = kept.pos ?? 0;
@@ -866,6 +871,7 @@ export default class ClaudeChat extends View {
     // The model as the transcript last named it (a reply's, or /model's output), and the effort
     // /effort last set: { level, model } (the model it was set on).
     this.model = kept.model ?? null; this.effort = kept.effort ?? null;
+    this.fill = kept.fill ?? null;
     this.drop = null; this.pickNote = null;
     this.limit = PAGE; this.problem = null; this.screen = null; this.up = 0;
     this.rowH = new Map(); this.seek = null;
@@ -1160,6 +1166,21 @@ export default class ClaudeChat extends View {
   // on as "high…"), the list opens upward: models, then efforts, the current of each ticked.
   // Picks only while Claude waits for you: a pick while it works would queue behind the turn,
   // and keys typed into the effort picker would land in its prompt instead.
+  // How full each agent's context is, for the status bar's context item (my-status): shared
+  // `chat.context` = { "<address>": { tokens, model } }, the shown agent's updated on each tick,
+  // agents that are gone dropped. The tokens are the last reply's own count in the transcript
+  // (what its request held, plus the reply; after a compaction, what was kept), so they're as of
+  // the last reply and a dev container's Claude has them too. (`this.fill`, not `this.ctx`: that
+  // is the right-click menu's, and reusing it sent every redraw into ctxMenu, which threw and
+  // froze the chat, 2026-11-18.)
+  shareFill() {
+    const now = shared(CONTEXT) ?? {};
+    const live = new Set(agents().map((a) => a.address));
+    const next = Object.fromEntries(Object.entries(now).filter(([address]) => live.has(address)));
+    if (this.address && this.fill?.tokens) next[this.address] = { tokens: this.fill.tokens, model: this.fill.model ?? null };
+    if (JSON.stringify(next) !== JSON.stringify(now)) setShared(CONTEXT, next);
+  }
+
   dropdown(t, agent) {
     const now = { model: this.modelNow(), effort: this.effortNow() };
     const p = this.pending?.address === this.address ? this.pending : null;
@@ -1227,6 +1248,7 @@ export default class ClaudeChat extends View {
       this.warming = true;
       cx.spawn(async () => { try { await this.warm(); await this.scanOthers(); this.publish(); } finally { this.warming = false; } });
     }
+    this.shareFill();
     // Claude's own settings, for the effort a session starts on (see effortNow), every 30 s.
     if (Date.now() - (this.claudeSettingsAt ?? 0) > 30000) {
       this.claudeSettingsAt = Date.now();
@@ -1283,6 +1305,7 @@ export default class ClaudeChat extends View {
             const file = where.container ? `projects/${folderName(session.cwd)}/${session.sessionId}.jsonl` : await transcriptOf(session);
             if (this.address !== address) return;
             this.items = []; this.tools = new Map(); this.skills = new Map(); this.subs = new Map(); this.trail = []; this.pos = 0; this.limit = PAGE;
+            this.fill = null;
             this.session = session; this.file = file; this.problem = file ? null : "No transcript yet: say something.";
             if (file) { await this.load(cx); if (!where.container) this.watch(file, cx); }
           } else if (where.container || this.stale) {
@@ -1372,6 +1395,7 @@ export default class ClaudeChat extends View {
         if (file !== this.file) return;
         if (text === null) {
           this.items = []; this.tools = new Map(); this.skills = new Map(); this.subs = new Map(); this.trail = []; this.pos = 0;
+          this.fill = null;
           this.again = true;
         } else if (text) { this.ingest(text); this.pos = end; if (more) this.again = true; }
       } while (this.again && file === this.file);
@@ -1465,7 +1489,10 @@ export default class ClaudeChat extends View {
       let d;
       try { d = JSON.parse(line); } catch { continue; }
       if (d.isSidechain && into === this) continue;
-      if (d.type === "system" && d.subtype === "compact_boundary") into.items.push({ kind: "note", text: "Conversation compacted" });
+      if (d.type === "system" && d.subtype === "compact_boundary") {
+        into.items.push({ kind: "note", text: "Conversation compacted" });
+        if (into === this && typeof d.compactMetadata?.postTokens === "number" && d.compactMetadata.postTokens > 0) this.fill = { tokens: d.compactMetadata.postTokens, model: this.fill?.model };
+      }
       if (d.type === "attachment" && d.attachment?.type === "skill_listing" && into === this) this.learnSkills(d.attachment.content);
       // A message sent during a turn, as Claude took it at its next step (2.1.323: an attachment
       // line; before, a reminder in a user line, see said).
@@ -1501,6 +1528,11 @@ export default class ClaudeChat extends View {
         // Where a fork made at the next message of yours starts from (see fork).
         if (into === this) this.lastReply = { session: d.sessionId, uuid: d.uuid };
         if (into === this && /^claude-/.test(d.message?.model ?? "")) this.model = modelLabel(d.message.model);
+        // How full the context is: what this reply's request held, plus the reply (see shareFill).
+        // An API error's line ("<synthetic>") has no usage.
+        const u = d.message?.usage;
+        const held = (u?.input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0);
+        if (into === this && held > 0) this.fill = { tokens: held + (u.output_tokens ?? 0), model: d.message.model };
         for (const b of content ?? []) {
           if (b.type === "text" && b.text.trim()) into.items.push({ kind: "claude", text: b.text.trim() });
           else if (b.type === "tool_use") {
@@ -2217,6 +2249,12 @@ export default class ClaudeChat extends View {
       .child(label);
   }
 
+  // How tall the middle of a card over the box (a question's options, a prompt's screen) may be
+  // before it scrolls: the chat's height less its header, the box and the card's own head and
+  // buttons. Without it a long question pushed the card's top off the window (the user's report
+  // 2026-11-18).
+  cardMax() { return Math.max(120, (this.rootH ?? 600) - 380); }
+
   status(t, agent) {
     // A box of Claude's own while Herdr says idle or done (boxText): shown like a blocked prompt.
     const box = agent.status !== "working" && agent.status !== "blocked" && Boolean(this.screen);
@@ -2236,7 +2274,8 @@ export default class ClaudeChat extends View {
           .child(div().font_semibold().text_color(t.foreground).child(box ? "Claude's terminal is showing this" : "Claude is asking"))
           .when(box, (el) => el.child(div().flex_1().min_w(0).truncate().text_size(px(11)).text_color(t.dim)
             .child("Sending a message closes it first (Esc)"))))
-        .when(Boolean(this.screen), (el) => el.child(div().p(8).rounded(6).bg(t.background).text_size(px(11))
+        .when(Boolean(this.screen), (el) => el.child(div().id("screen-card").max_h(this.cardMax()).overflow_y_scrollbar()
+          .p(8).rounded(6).bg(t.background).text_size(px(11))
           .font_family(this.mono()).text_color(t.foreground).child(this.screen)))
         .child(h_flex().gap(6).flex_wrap()
           .children(keys.map((k) => this.button(t, `key-${k}`, label[k] ?? k, this.keys(k), k === "1")))
@@ -2363,9 +2402,9 @@ export default class ClaudeChat extends View {
       .when(this.dial === key, (el) => el.child(div().px(8).pb(4).child(dial())));
     // Any font on this computer: the third pill (the picked family's name, else "Other…") opens
     // a list under the row, each family with a sample in its own face (the name stays in the
-    // popup's font: a symbol font's own name can't be read). At most FONT_ROWS are drawn.
+    // popup's font: a symbol font's own name can't be read). It draws FONT_PAGE rows and more as
+    // you scroll (`fontMax`), since each row is a font to load.
     const own = ownFont(look);
-    const FONT_ROWS = 60;
     const fontPill = div().id("look-font-own").px(8).h(22).max_w(130).flex().items_center().gap(4).rounded(5)
       .text_size(12).cursor_pointer()
       .when(own, (el) => el.bg(t.selected).text_color(t.foreground))
@@ -2380,14 +2419,21 @@ export default class ClaudeChat extends View {
         .child(div().h(28).px(8).flex().items_center().border_b(1).border_color(t.border)
           .text_size(12).text_color(t.foreground).child(Input.new(this.fontFind)))
         .child(v_flex().id("look-fonts").flex_none().h(150).p(2).overflow_y_scrollbar()
-          .children(found.slice(0, FONT_ROWS).map((name, i) => h_flex().id(`look-font-${i}`).flex_none().h(24).px(6).gap(8).items_center().rounded(4).cursor_pointer()
+          .on_scroll_wheel((e, cx) => {
+            if (e.delta.y >= 0 || this.fontMax >= found.length) return;
+            this.fontMax += FONT_PAGE;
+            cx.notify();
+          })
+          .children(found.slice(0, this.fontMax).map((name, i) => h_flex().id(`look-font-${i}`).flex_none().h(24).px(6).gap(8).items_center().rounded(4).cursor_pointer()
             .when(look.font === name, (el) => el.bg(t.selected))
             .hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => { setLook({ font: name }); cx.notify(); })
             .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(name))
             .child(div().flex_none().font_family(name).text_size(13).text_color(t.muted).child("Hello 123"))))
-          .when(found.length > FONT_ROWS, (el) => el.child(div().flex_none().h(24).px(6).flex().items_center().text_size(11).text_color(t.dim)
-            .child(`${found.length - FONT_ROWS} more: type to narrow`)))
+          .when(found.length > this.fontMax, (el) => el.child(div().id("look-fonts-more").flex_none().h(24).px(6).flex().items_center().text_size(11).text_color(t.dim)
+            .cursor_pointer().hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => { this.fontMax += FONT_PAGE; cx.notify(); })
+            .child(`Show more (${found.length - this.fontMax} left)`)))
           .when(!found.length, (el) => el.child(div().h(24).px(6).flex().items_center().text_size(11).text_color(t.dim).child("No font by that name"))));
     };
     return v_flex().w_full().p(5).bg(t.popover).text_size(12.8)
@@ -2402,9 +2448,13 @@ export default class ClaudeChat extends View {
       .child(row("Tool calls", pills(seg("tools", "show", "Show"), seg("tools", "hide", "Hide"))))
       .child(row("Earlier turns", pills(seg("history", "fold", "Fold"), seg("history", "show", "Show"))))
       .child(row("Your messages", pills(seg("mine", "box", "Box"), seg("mine", "tint", "Tint"), seg("mine", "bar", "Bar"))))
-      .child(colors("accent", "Accent (all of Herdr)", ACCENTS))
-      .child(colors("bg", "Background (all of Herdr)", BGS))
-      .child(colors("fg", "Text (all of Herdr)", FGS))
+      // "(all of Herdr)" was in each label until 2026-11-18: with it the rows were wider than the
+      // popup and the hex boxes were cut off at its right edge (the user's screenshot).
+      .child(div().px(8).pt(10).pb(4).text_size(11).text_color(t.dim).child("Colors · all of Herdr"))
+      .child(colors("accent", "Accent", ACCENTS))
+      .child(colors("bg", "Background", BGS))
+      .child(colors("fg", "Text", FGS))
+      .child(div().h(6))
       .child(row("Spacing", pills(seg("space", "tight", "Tight"), seg("space", "normal", "Normal"), seg("space", "roomy", "Roomy"))))
       .child(div().px(8).pt(10).pb(4).text_size(11).text_color(t.dim).child("+ menu"))
       .child(row("Claude (dev container)", this.dev === "error"
@@ -2717,6 +2767,7 @@ export default class ClaudeChat extends View {
 
     // Ctrl+F from anywhere in the chat (the box, the search box) opens the search, or goes back to it.
     return root.id("chat-root").track_focus(this.rootKeys)
+      .on_size_change((s, cx) => { if (s.height !== this.rootH) { this.rootH = s.height; cx.notify(); } })
       .on_key_down((e, cx) => {
         if (e.keystroke === "escape" && agent.status === "working" && !this.stuck && !menu) { cx.stop_propagation(); this.stop(cx); return; }
         if (!["ctrl-f", "cmd-f"].includes(e.keystroke)) return;
@@ -2737,7 +2788,7 @@ export default class ClaudeChat extends View {
         .child(div().id("chat-settings").flex_none().p(4).rounded(6).text_color(t.dim).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .tooltip("Chat settings")
-          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 640, props: { settings: true } }))
+          .on_click(() => openOverlay({ mod: "claude-chat", kind: "popup", width: 360, height: 680, props: { settings: true } }))
           .child(svg("mods/workspace-chrome/settings.svg").size(14)))
         .child(props()?.stack ? viewSwitch(t, "chat", () => this.toTerminal(agent.address))
           : this.button(t, "terminal", "Terminal", () => this.toTerminal(agent.address))))

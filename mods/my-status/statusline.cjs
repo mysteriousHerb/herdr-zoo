@@ -34,6 +34,16 @@ process.stdin.on("end", () => {
   try {
     const p = JSON.parse(input.toString("utf8"));
     if (p.rate_limits) save("usage.json", { at: Date.now(), rate_limits: p.rate_limits, model: p.model?.display_name ?? null, version: p.version ?? null });
+    // How big each model's context window is, for the chat's context item (claude-chat): the
+    // transcript it reads has the tokens used, not the window. windows.json = { "<model id>": tokens },
+    // under the id as given and without a "[1m]"-style suffix (the transcript names models without).
+    const size = p.context_window?.context_window_size, id = p.model?.id;
+    if (size > 0 && typeof id === "string") {
+      let known = {};
+      try { known = JSON.parse(fs.readFileSync(path.join(dir, "windows.json"), "utf8")); } catch {}
+      const bare = id.replace(/\[.*$/, "");
+      if (known[id] !== size || known[bare] !== size) save("windows.json", { ...known, [id]: size, [bare]: size });
+    }
   } catch {} // never break the status line
   const next = process.argv[2];
   if (next) {
