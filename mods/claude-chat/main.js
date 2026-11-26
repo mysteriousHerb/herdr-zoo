@@ -227,6 +227,29 @@ const fade = (color, alpha) => /^#[0-9a-f]{6}/i.test(color) ? color.slice(0, 7) 
 // A text size from the 13 px design, scaled to the chosen size.
 const px = (n) => Math.round((n * chatLook().size) / 13 * 2) / 2;
 const NARROW = 820;
+
+// The http(s) links in some markdown or plain text, in order, each once: [label](url), <url> and
+// bare addresses (trailing punctuation left off). label = the address without its scheme.
+const MAX_LINKS = 5;
+function linksIn(text) {
+  const out = [], seen = new Set();
+  // Code is left out (an address there is an example, and TextView doesn't link it): fenced blocks,
+  // then `spans` (not escaped backticks, \`). Then markdown's backslash escapes come off: your
+  // messages are drawn escaped (plainEscape).
+  text = text.replace(/^ {0,3}(`{3,}|~{3,})[\s\S]*?(^ {0,3}\1|$(?![\s\S]))/gm, " ")
+    .replace(/(?<![\\`])(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g, " ")
+    .replace(/\\([\\`*_{}[\]()<>#+\-.!|~&])/g, "$1");
+  const re =/\]\(\s*<?(https?:\/\/[^\s)>]+)|<(https?:\/\/[^\s>]+)>|(https?:\/\/[^\s<>()[\]{}"'`|\\^]+)/gi;
+  for (const m of text.matchAll(re)) {
+    const url = (m[1] ?? m[2] ?? m[3]).replace(/[.,;:!?*_~]+$/, "");
+    // a.com and a.com/ are the same link.
+    const key = url.replace(/\/$/, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ url, label: url.replace(/^https?:\/\/(www\.)?/i, "").replace(/\/$/, "") });
+  }
+  return out;
+}
 // How many messages to draw at first; "Show earlier" adds this many more.
 const PAGE = 120;
 // One of Claude's own boxes is on its screen while Herdr says idle or done (Ctrl+R's history
@@ -796,8 +819,11 @@ export default class ClaudeChat extends View {
     this.typed = ""; this.menuAt = 0; this.menuOff = false;
     // The "/word" being typed, anywhere in the box (see slashAt), or null.
     this.slash = null;
-    // The right-click menu over the log: { x, y (in the log), text (the message under the pointer) }.
+    // The right-click menu over the log: { x, y (in the log), text (the message under the pointer),
+    // sel (the selection when it opened) }.
     this.ctx = null;
+    // The last selection a message's TextView reported (selView): { id, text, md, gone? }.
+    this.sel = null; this.selGone = null;
     // A redraw rebuilds every message, so typing redraws only for the / menu, the one thing
     // that depends on what's typed (the box draws its own text).
     this.box.on("change", (_e, cx) => {
@@ -1827,8 +1853,8 @@ export default class ClaudeChat extends View {
         .when(mine === "bar", (el) => el.border_l(3).border_color(t.accent))
         // A TextView so it can be selected like Claude's text; escaped so it shows as typed.
         .child(h_flex().w_full().gap(8).items_center()
-          .child(div().flex_1().min_w(0).child(TextView.markdown(`me-${i}`,
-            this.markIn(i) ? plainMarked(item.text, this.marks.re, this.markIn(i)) : plainMarkdown(item.text)).selectable(true)))
+          .child(div().flex_1().min_w(0).child(this.selView(`me-${i}`,
+            this.markIn(i) ? plainMarked(item.text, this.marks.re, this.markIn(i)) : plainMarkdown(item.text))))
           // Sent while Claude worked: it read this at its next step, not as a turn of its own.
           .when(Boolean(item.mid), (el) => el.child(div().flex_none().text_size(px(11)).text_color(t.dim).tooltip("Sent while Claude was working; it read it at its next step").child("mid-turn")))
           .when(Boolean(item.before && this.agentNow), (el) => el.child(div().id(`fork-${i}`).flex_none().p(2).rounded(4)
@@ -1844,11 +1870,11 @@ export default class ClaudeChat extends View {
         .on_mouse_down("right", (e) => this.ctxHit(e, item))
         .child(div().mt(4).size(8).flex_none().rounded(4).bg(t.accent))
         .when(!parts, (el) => el.child(div().flex_1().min_w(0).text_color(t.foreground)
-          .child(TextView.markdown(`md-${i}`, marked(item.text)).selectable(true))))
+          .child(this.selView(`md-${i}`, marked(item.text)))))
         // With code blocks: a TextView per piece, each block with its copy button on top.
         .when(Boolean(parts), (el) => el.child(v_flex().flex_1().min_w(0).gap(8).text_color(t.foreground)
           .children(parts.map((p, k) => {
-            const view = TextView.markdown(`md-${i}-${k}`, p.code === undefined ? marked(p.md) : p.md).selectable(true);
+            const view = this.selView(`md-${i}-${k}`, p.code === undefined ? marked(p.md) : p.md);
             if (p.code === undefined) return div().w_full().child(view);
             const id = `copy-${i}-${k}`, done = this.copied === id;
             return div().relative().w_full().child(view)
@@ -2168,7 +2194,7 @@ export default class ClaudeChat extends View {
   queuedRow(t, q, k, agent) {
     return div().id(`queued-${k}`).w_full().px(12).py(8).rounded(8).border(1).border_color(fade(t.accent, "40"))
       .bg(fade(t.accent, "0d")).text_color(t.muted)
-      .child(div().child(TextView.markdown(`queued-text-${k}`, plainMarkdown(q.text)).selectable(true)))
+      .child(div().child(this.selView(`queued-text-${k}`, plainMarkdown(q.text))))
       .child(h_flex().mt(6).gap(10).items_center().text_size(px(11.5)).text_color(t.dim)
         .child(div().flex_1().min_w(0).truncate().child(q.acting ? "…" : "Queued · Claude reads it at its next step, or when this turn ends"))
         .when(!q.acting, (el) => el
@@ -2517,38 +2543,71 @@ export default class ClaudeChat extends View {
     else this.ctxItem = { at: e.position, text: item.text };
   }
 
-  // A right-click anywhere in the log opens the menu there. The selected text can't be had: a
-  // TextView has no selection API, and running Herdr's copy from here (terminal.copy, the
-  // shell_root::Copy and input::Copy actions Ctrl+C goes through) left the clipboard untouched
-  // (tried 2026-11-06), so the menu works on whole messages.
+  // A selectable message view that reports its selection (Herdr 0.1.18's on_selection_change: on
+  // release, double/triple click, select-all; null when it's cleared). `src` is the markdown the
+  // view draws, so the selection's range maps into it and the links inside can be found.
+  selView(id, src) {
+    return TextView.markdown(id, src).selectable(true).on_selection_change((s) => {
+      if (s && s.text) {
+        this.sel = { id, text: s.text, md: s.range ? src.slice(s.range.start, s.range.end) : s.text };
+      } else if (this.sel?.id === id) {
+        this.selGone = { ...this.sel, gone: Date.now() }; this.sel = null;
+      }
+    });
+  }
+
+  // A right-click anywhere in the log opens the menu there. It also takes the selection as it was:
+  // the right press may clear it before this runs, so one cleared a moment ago still counts.
   openCtx(e, cx) {
     const hit = this.ctxItem;
     // The position comes in window pixels; lengths are laid out at the zoom (as my-tabs does).
     const z = settings().zoom || 1;
     const local = e.local_position ?? { x: 0, y: 0 };
     const text = hit && hit.at.x === e.position.x && hit.at.y === e.position.y ? hit.text : null;
+    const sel = this.sel ?? (this.selGone && Date.now() - this.selGone.gone < 400 ? this.selGone : null);
     this.ctxItem = null;
-    this.ctx = { at: e.position, x: local.x / z, y: local.y / z, text };
+    this.ctx = { at: e.position, x: local.x / z, y: local.y / z, text, sel };
     cx.notify();
   }
 
-  // Copy message = the whole message as written (markdown); Quote in chat = it goes into the box
-  // as a "> " quote. A press anywhere else closes the menu.
+  // Copy selection = the selected text as it reads; Copy message = the whole message as written
+  // (markdown); Quote in chat = it goes into the box as a "> " quote. Then a row per link: the
+  // links inside the selection if it has any, else the clicked message's (a TextView doesn't say
+  // which link is under the pointer). A press anywhere else closes the menu.
   ctxMenu(t) {
-    const W = 200, H = 2 * 27 + 8;
+    const { text, sel } = this.ctx;
+    const links = linksIn(sel?.md ?? "");
+    if (!links.length && text) links.push(...linksIn(text));
+    links.splice(MAX_LINKS);
+    const W = links.length ? 280 : 200;
+    const H = ((sel ? 1 : 0) + 2 + links.length) * 27 + (links.length ? 9 : 0) + 8;
     const x = Math.max(0, Math.min(this.ctx.x, (this.viewW ?? W) - W));
     const y = this.ctx.y + H > (this.viewH ?? 0) ? Math.max(0, this.ctx.y - H) : this.ctx.y;
     const close = (cx) => { this.ctx = null; cx.notify(); };
-    const text = this.ctx.text;
-    const row = (id, label, onClick) => h_flex().id(`ctx-${id}`).h(26).px(8).gap(8).items_center().rounded(5)
-      .text_size(px(12.5)).text_color(text ? t.foreground : t.dim)
-      .when(Boolean(text), (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { onClick(cx); close(cx); }))
+    const row = (id, label, onClick, on = true) => h_flex().id(`ctx-${id}`).h(26).px(8).gap(8).items_center().rounded(5)
+      .text_size(px(12.5)).text_color(on ? t.foreground : t.dim)
+      .when(on, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => { onClick(cx); close(cx); }))
       .child(label);
+    // A link: its address (shortened) opens it; Copy beside it copies it.
+    const linkRow = (l, k) => h_flex().id(`ctx-link-${k}`).h(26).pl(8).pr(2).gap(4).items_center().rounded(5)
+      .text_size(px(12.5)).text_color(t.foreground).cursor_pointer().hover((s) => s.bg(t.hover))
+      .tooltip(`Open ${l.url}`)
+      .on_click((_e, cx) => { cx.open_url(l.url); close(cx); })
+      .child(div().flex_none().text_color(t.dim).child("↗"))
+      .child(div().flex_1().min_w(0).truncate().child(l.label))
+      .child(div().id(`ctx-link-copy-${k}`).flex_none().px(6).py(1).rounded(4).text_size(px(11.5)).text_color(t.dim)
+        .hover((s) => s.bg(t.surface).text_color(t.foreground)).tooltip("Copy link")
+        .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(l.url); close(cx); })
+        .child("Copy"));
     return v_flex().id("ctx-menu").absolute().left(x).top(y).w(W).p(4).gap(1).rounded(8)
       .bg(t.popover).border(1).border_color(t.border).shadow_md()
       .on_mouse_down_out((_e, cx) => close(cx))
-      .child(row("copy-msg", "Copy message", (cx) => cx.write_to_clipboard(text)))
-      .child(row("quote", "Quote message in chat", () => this.quote(text)));
+      .when(Boolean(sel), (el) => el.child(row("copy-sel", "Copy selection", (cx) => cx.write_to_clipboard(sel.text))))
+      .child(row("copy-msg", "Copy message", (cx) => cx.write_to_clipboard(text), Boolean(text)))
+      .child(row("quote", "Quote message in chat", () => this.quote(text), Boolean(text)))
+      .when(links.length > 0, (el) => el
+        .child(div().my(4).h(1).bg(t.border))
+        .children(links.map(linkRow)));
   }
 
   // Puts text into the box as a markdown quote, after what's there, and gives the box the keyboard.
